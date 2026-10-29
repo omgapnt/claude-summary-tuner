@@ -8,7 +8,6 @@
 [![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)](#quick-start)
 [![Claude Code 2.1.312 tested](https://img.shields.io/badge/Claude%20Code-2.1.312%20tested-D97757)](#replicate-the-flamerix-test)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![tests](https://github.com/omgapnt/claude-summary-tuner/actions/workflows/test.yml/badge.svg)](.github/workflows/test.yml)
 
 **One file · no admin · no Node · fully undoable · measure first, then change**
 
