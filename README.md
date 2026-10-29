@@ -2,7 +2,7 @@
 
 # Claude Summary Tuner
 
-### Claude Code re-sends your whole subagent transcript every ~30 s to draw a 3-word status line.<br>Measure what that costs you on Windows, then slow it down or switch it off.
+### Claude Code re-sends your whole subagent transcript every ~30s, burning ~15–20% of your tokens on a 3-word status line.<br>Measure what that costs you on Windows, then slow it down or switch it off.
 
 [![PowerShell 5.1 | 7](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)](#quick-start)
 [![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)](#quick-start)
