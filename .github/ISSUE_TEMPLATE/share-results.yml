@@ -1,0 +1,53 @@
+name: "📊 Share your results"
+description: Post your baseline vs. throttled numbers (or a Replicate run) so others can see the real-world effect.
+title: "[results] "
+labels: ["results"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for measuring! Copy the numbers from the **Periods** table of your report (menu 7 / `-Report`).
+        **Privacy:** don't paste your PC name, user name, paths or session ids. The report header shows them, so
+        blur them in screenshots.
+  - type: input
+    id: cc_version
+    attributes: { label: Claude Code version(s), placeholder: "2.1.312" }
+    validations: { required: true }
+  - type: dropdown
+    id: ps
+    attributes: { label: PowerShell, options: ["Windows PowerShell 5.1", "PowerShell 7.x"] }
+  - type: dropdown
+    id: mode
+    attributes:
+      label: What did you compare?
+      options: ["Baseline vs Slow 5 min", "Baseline vs Custom minutes", "Baseline vs Off", "Replicate run only", "Other"]
+    validations: { required: true }
+  - type: input
+    id: minutes
+    attributes: { label: Custom minutes (if any), placeholder: "2.5" }
+  - type: textarea
+    id: periods
+    attributes:
+      label: Periods table
+      description: For each period, give the active hours, requests, est. cost, agent_summary reqs, agent_summary cost, share of cost and AS $/active h.
+      render: text
+    validations: { required: true }
+  - type: textarea
+    id: replicate
+    attributes:
+      label: Replicate result (optional)
+      description: The no hook / pass / off forks, the slow arm, and the telemetry counts.
+      placeholder: "5 / 5 / 0, slow 1 min: 2"
+  - type: textarea
+    id: workload
+    attributes:
+      label: Your workload
+      description: For example, how many subagents or background agents you run per day, the main model, and Pro/Max/API.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I restarted every Claude Code session (including `claude daemon stop --any` and the desktop app) after each change
+        - label: I removed personal info (PC name, user name, paths, session ids)
+          required: true

@@ -1,0 +1,12 @@
+# local runs / generated reports
+report-*.html
+*.tsv
+actions.jsonl
+hook.log
+replicate/
+*.log
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

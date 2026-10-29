@@ -1,0 +1,8 @@
+* text=auto
+*.ps1 text eol=crlf
+*.sh  text eol=lf
+*.js  text eol=lf
+*.png binary
+# The single-file download is committed byte-for-byte as src/build.sh emits it (CRLF, ASCII),
+# so raw.githubusercontent.com downloads are identical to the build output.
+/Claude-Summary-Tuner.ps1 -text

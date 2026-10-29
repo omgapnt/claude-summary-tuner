@@ -1,0 +1,54 @@
+{
+    "t":  "2026-10-29T14:41:11.931Z",
+    "version":  "2.1.312",
+    "sha12":  "6099672ebe5d",
+    "static":  "OK",
+    "forks":  "5 / 5 / 0",
+    "fired":  "5 / 5 / 0",
+    "slow":  "slow 1 min: forks 2, fired 2",
+    "telemetry":  "5 / 5 / 0 / 2",
+    "cost":  "$0.027",
+    "exe":  "C:\\Users\\you\\.local\\bin\\claude.exe",
+    "arms":  {
+                 "nohook":  {
+                                "forks":  5,
+                                "fired":  5,
+                                "seconds":  186,
+                                "cost":  0.0082840500000000011,
+                                "is_error":  false,
+                                "result":  "done",
+                                "hook_log":  "",
+                                "debug_file":  "C:\\Users\\you\\AppData\\Local\\Temp\\cst-test\\data\\replicate\\20261029-152904\\nohook\\debug.log"
+                            },
+                 "pass":  {
+                              "forks":  5,
+                              "fired":  5,
+                              "seconds":  177,
+                              "cost":  0.0083404150000000021,
+                              "is_error":  false,
+                              "result":  "done",
+                              "hook_log":  "2026-10-29T14:32:12.006Z pid=78580 preload active mode=pass bun=1.4.4 hooked=global.setTimeout,timers.setTimeout,global.setInterval,timers.setInterval | 2026-10-29T14:32:15.718Z pid=78580 summary timer #1 passed (control, setTimeout, delay=30000) | 2026-10-29T14:32:48.094Z pid=78580 summary timer #2 passed (control, setTimeout, delay=30000) | 2026-10-29T14:33:18.656Z pid=78580 summary timer #3 passed (control, setTimeout, delay=30000) | 2026-10-29T14:33:49.717Z pid=78580 summary timer #4 passed (control, setTimeout, delay=30000) | 2026-10-29T14:34:21.164Z pid=78580 summary timer #5 passed (control, setTimeout, delay=30000) | 2026-10-29T14:34:52.495Z pid=78580 summary timer #6 passed (control, setTimeout, delay=30000) | 2026-10-29T14:35:07.674Z pid=78580 exit: 0 summary timer(s) suppressed, 0 slowed, 6 matched",
+                              "debug_file":  "C:\\Users\\you\\AppData\\Local\\Temp\\cst-test\\data\\replicate\\20261029-152904\\pass\\debug.log"
+                          },
+                 "off":  {
+                             "forks":  0,
+                             "fired":  0,
+                             "seconds":  177,
+                             "cost":  0.0049323600000000011,
+                             "is_error":  false,
+                             "result":  "done",
+                             "hook_log":  "2026-10-29T14:35:08.893Z pid=85356 preload active mode=off bun=1.4.4 hooked=global.setTimeout,timers.setTimeout,global.setInterval,timers.setInterval | 2026-10-29T14:35:12.494Z pid=85356 summary timer #1 suppressed (setTimeout, delay=30000) | 2026-10-29T14:38:04.305Z pid=85356 exit: 1 summary timer(s) suppressed, 0 slowed, 1 matched",
+                             "debug_file":  "C:\\Users\\you\\AppData\\Local\\Temp\\cst-test\\data\\replicate\\20261029-152904\\off\\debug.log"
+                         },
+                 "slow":  {
+                              "forks":  2,
+                              "fired":  2,
+                              "seconds":  179,
+                              "cost":  0.005496815,
+                              "is_error":  false,
+                              "result":  "done",
+                              "hook_log":  "2026-10-29T14:38:05.518Z pid=76300 preload active mode=slow min_delay=60000 bun=1.4.4 hooked=global.setTimeout,timers.setTimeout,global.setInterval,timers.setInterval | 2026-10-29T14:38:09.234Z pid=76300 summary timer #1 slowed (setTimeout, delay=30000 -\u003e 60000) | 2026-10-29T14:39:10.227Z pid=76300 summary timer #2 slowed (setTimeout, delay=30000 -\u003e 60000) | 2026-10-29T14:40:11.587Z pid=76300 summary timer #3 slowed (setTimeout, delay=30000 -\u003e 60000) | 2026-10-29T14:41:03.736Z pid=76300 exit: 0 summary timer(s) suppressed, 3 slowed, 3 matched",
+                              "debug_file":  "C:\\Users\\you\\AppData\\Local\\Temp\\cst-test\\data\\replicate\\20261029-152904\\slow\\debug.log"
+                          }
+             }
+}
