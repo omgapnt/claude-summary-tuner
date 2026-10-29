@@ -47,7 +47,7 @@ function Get-ClaudeProcesses($hookRows) {
     $kind = 'Session'; $relevant = $true
     if ($path -like '*\WindowsApps\Claude_*' -or $path -like '*\AnthropicClaude\*' -or $path -like '*\Programs\Claude\*') {
       if ($cmd -match '--type=') { continue }
-      $kind = 'Desktop app (restart it)'
+      $kind = 'Desktop app (main)'
     } elseif ($path -like '*\Claude\claude-code\*') { $kind = 'Desktop app Code session' }
     elseif ($cmd -match '\bdaemon\s+run') { $kind = 'Daemon' }
     elseif ($cmd -match '--bg-pty-host') { $kind = 'Daemon pty host' }
@@ -56,7 +56,7 @@ function Get-ClaudeProcesses($hookRows) {
     elseif ($cmd -match '\s--bg(\s|$)|bg-spare|--bg-session') { $kind = 'Background session' }
     $created = $null; if ($p.CreationDate) { $created = ([datetime]$p.CreationDate).ToUniversalTime() }
     $hook = '-'
-    if ($kind -ne 'Desktop app (restart it)') {
+    if ($kind -ne 'Desktop app (main)' -and $relevant) {
       $hook = 'NO'
       if ($hookRows -and $created) {
         $ln = $hookRows | Where-Object { $_.pid -eq $p.ProcessId -and $_.msg -like 'preload active*' -and $_.t -ge $created.AddSeconds(-10) } | Select-Object -Last 1

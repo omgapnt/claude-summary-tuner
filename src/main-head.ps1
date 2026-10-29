@@ -4,8 +4,9 @@
   WHAT IT DOES
     Claude Code (v2.1.232+) re-sends each background agent's whole transcript to the model about every
     30 seconds, just to show a 3-5 word status in the agents panel ("agent_summary"). Flamerix AI measured
-    this at ~16% of all Claude Code spend. This script:
-      1. installs Flamerix's Bun --preload hook (embedded below) through the BUN_OPTIONS user variable,
+    this at ~16% of spend in their setup (Anthropic reports ~2% on average). This script:
+      1. installs Flamerix's Bun --preload hook (embedded below) through the BUN_OPTIONS user variable
+         (written as --preload=<path>, the form that does not break the standalone bun CLI),
          in one of these modes: baseline (hook counts only), slow (every 5 min or custom), off;
       2. optionally runs a tiny local logger that records Claude Code's own OpenTelemetry cost events
          (no prompt text, no e-mail) so you can measure before/after;
@@ -70,7 +71,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
 $ToolName = 'Claude-Summary-Tuner'
-$ToolVersion = '1.0.0'
+$ToolVersion = '1.0.1'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'cc-summary-tuner' }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'

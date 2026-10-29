@@ -2,11 +2,12 @@
 
 # Claude Summary Tuner
 
-### Claude Code re-sends your whole subagent transcript every ~30s, burning ~15–20% of your tokens on a 3-word status line.<br>Measure what that costs you on Windows, then slow it down or switch it off.
+### Claude Code re-sends each background agent's whole transcript every ~30 s, just to refresh a 3–5 word status line.<br>In Flamerix's measurement that was up to ~16% of spend (Anthropic says ~2% on average). Measure your own share on Windows, then slow it down or switch it off.
 
 [![PowerShell 5.1 | 7](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE?logo=powershell&logoColor=white)](#quick-start)
 [![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)](#quick-start)
 [![Claude Code 2.1.312 tested](https://img.shields.io/badge/Claude%20Code-2.1.312%20tested-D97757)](#replicate-the-flamerix-test)
+[![Desktop app 2.1.309 tested](https://img.shields.io/badge/Desktop%20app%20CLI-2.1.309%20tested-D97757)](#the-claude-desktop-app)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/omgapnt/claude-summary-tuner?color=D97757)](https://github.com/omgapnt/claude-summary-tuner/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/omgapnt/claude-summary-tuner/total?color=555)](https://github.com/omgapnt/claude-summary-tuner/releases)
@@ -69,6 +70,9 @@ powershell -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1
 Or download `Claude-Summary-Tuner.ps1` from the [latest release](https://github.com/omgapnt/claude-summary-tuner/releases/latest).
 Pick an option from the menu. Then **close and restart every Claude Code session** (see
 [Restart everything](#-restart-everything-after-every-change)).
+
+> **Upgrading from v1.0.0?** Run the new script once with your current mode (e.g. `-Mode off`). It switches
+> `BUN_OPTIONS` to the `--preload=` form, which fixes standalone `bun install`, and keeps your mode and data.
 
 > Read the script before you run it. It is one plain-text file, and the hook is embedded near the top as `$HookJs`.
 
@@ -166,7 +170,7 @@ baseline → switch experiment is for.
 flowchart LR
     subgraph You["Your Windows user account"]
         PS["Claude-Summary-Tuner.ps1"] -- writes --> HOOK["%LOCALAPPDATA%\cc-summary-tuner\no-agent-summary.js"]
-        PS -- sets user env --> ENV["BUN_OPTIONS=--preload …<br>CC_AGENT_SUMMARY_MODE=pass|slow|off"]
+        PS -- sets user env --> ENV["BUN_OPTIONS=--preload=…<br>CC_AGENT_SUMMARY_MODE=pass|slow|off"]
         PS -- journal --> J["actions.jsonl"]
     end
     ENV --> CC["claude.exe (Bun)"]
@@ -188,9 +192,35 @@ flowchart LR
   `/$bunfs/…` on Linux/macOS and `X:/~BUN/…` on Windows.
 - **BUN_OPTIONS quirks:** Bun needs forward slashes and no spaces. Quoted paths are silently ignored. If your
   profile path contains a space, the script uses the 8.3 short path or a `%ProgramData%` folder, and it checks
-  that the preload really loads before it saves anything.
+  that the preload really loads before it saves anything. Since v1.0.1 it writes `--preload=<path>`. The older
+  space form, `--preload <path>`, breaks standalone `bun` subcommands (see the FAQ).
 - **The logger** is a small PowerShell `HttpListener` on a loopback port, with a `TcpListener` fallback. It autostarts hidden at logon via
   `HKCU\…\Run\ClaudeSummaryTunerCollector`, which shows up in Task Manager → Startup apps.
+
+## The Claude desktop app
+
+The desktop app's **Code tab does not use your terminal's Claude Code**. It runs its own bundled copy from
+`%APPDATA%\Claude\claude-code\<version>\…\claude.exe` (2.1.309 in desktop app 4.4212, Microsoft Store/MSIX
+install). What we found on one Windows PC:
+
+- The app passes its environment, including `BUN_OPTIONS` and `CC_AGENT_SUMMARY_*`, through to Code-tab
+  sessions, and it **turns agent progress summaries on by itself**, so those sessions make these calls too.
+- The bundled binary is the same kind of Bun build (`Bun.main = B:/~BUN/root/cli`), so the same hook works there.
+  The same Replicate protocol run against it gave **5 / 5 / 0** (no hook / `pass` / `off`) and **2** with slow at
+  1 min. The hook loads there with the `--preload=` form too.
+- We ran the test against the bundled binary directly. We have **not yet watched a live Code-tab session** with
+  the hook loaded.
+
+What to do:
+
+- **Fully quit the app** after installing or changing the mode (tray icon > Quit, not just closing the window),
+  then reopen it. It only picks up the setting when it starts.
+- **Re-check after app updates.** An update can bring a new `claude-code\<version>` folder. `-Status` lists the
+  bundled versions, checks the hook loads in each, and warns when a version is new since you set the mode.
+- **Cowork mode is probably not covered.** It runs a separate Linux build of Claude Code in its own VM, which
+  your Windows environment variables don't reach. Untested.
+
+The raw result is in [`test/fixtures/desktop-2.1.309.json`](test/fixtures/desktop-2.1.309.json).
 
 ## ⚠ Restart everything after every change
 
@@ -202,7 +232,8 @@ Environment variables are read only when a process starts. After **each** mode c
   background sessions**, and the script offers to run it for you;
 - the **Claude desktop app**: quit it from the tray icon, then reopen it.
 
-Run `-CheckRestart` or `-Status` to see which Claude processes still run the old setting.
+Run `-CheckRestart` or `-Status` to see which Claude processes still run the old setting. Both also list the
+desktop app and its Code-tab processes and tell you when the app was started before the change.
 
 ## Safety & privacy
 
@@ -217,8 +248,8 @@ Run `-CheckRestart` or `-Status` to see which Claude processes still run the old
   company setup, the script warns you and leaves those settings alone.
 - **No downloads at runtime.** The hook and logger are embedded in the script, and the report loads nothing from
   the internet.
-- **Before you share a report:** its header contains your PC name and data-folder path, which includes your
-  Windows user name. Blur them first.
+- **Shareable reports.** Since v1.0.1 the report leaves out your PC name and shows paths as `%LOCALAPPDATA%`,
+  `%USERPROFILE%` and so on, without your Windows user name. Have a quick look before you post it anyway.
 
 ## Uninstall
 
@@ -227,7 +258,7 @@ Run `-CheckRestart` or `-Status` to see which Claude processes still run the old
 .\Claude-Summary-Tuner.ps1 -Uninstall -DeleteData
 ```
 
-Without the script: delete the user env vars `BUN_OPTIONS` (or only our `--preload …no-agent-summary.js` part of
+Without the script: delete the user env vars `BUN_OPTIONS` (or only our `--preload=…no-agent-summary.js` part of
 it), `CC_AGENT_SUMMARY_MODE`, `CC_AGENT_SUMMARY_MIN_DELAY_MS` and `CC_AGENT_SUMMARY_LOG`. If you used the logger,
 also delete the four `OTEL_*`/`CLAUDE_CODE_ENABLE_TELEMETRY` variables and the `ClaudeSummaryTunerCollector`
 Run value. Then restart every Claude Code session.
@@ -246,30 +277,38 @@ desktop app. Run `-Status`: every process shows **Hook loaded** yes or no. Stop 
 
 <details><summary><b>I set BUN_OPTIONS by hand and the hook doesn't load.</b></summary>
 
-Bun ignores a quoted path **silently**, and a path with spaces breaks it. Use forward slashes with no quotes,
-e.g. `--preload C:/Users/you/AppData/Local/cc-summary-tuner/no-agent-summary.js`, or let the script set it.
+Bun ignores a quoted path **silently**, and a path with spaces breaks it. Use forward slashes with no quotes and
+the `=` form, e.g. `--preload=C:/Users/you/AppData/Local/cc-summary-tuner/no-agent-summary.js`, or let the
+script set it.
 </details>
 
 <details><summary><b>Claude Code updated. Am I still protected?</b></summary>
 
 Maybe not. The hook matches on source text, and an update can rename what it looks for. It **fails open**: the
-summaries silently come back, and nothing breaks. After every update, run `-Replicate` (about $0.03) or watch the report's hook evidence table. A period in slow/off mode with zero matched timers means the
-anchors no longer match.
+summaries silently come back, and nothing breaks. `-Status` warns when your Claude Code version (or the desktop
+app's bundled one) differs from the one you set the mode with. It changes nothing itself. After an update, run
+`-Replicate` (about $0.03) or watch the report's hook evidence table. A period in slow/off mode with zero matched
+timers means the anchors no longer match.
 </details>
 
 <details><summary><b>I also use the standalone <code>bun</code> CLI. Anything to know?</b></summary>
 
-Yes, a known issue in v1.0.0. The script writes `BUN_OPTIONS` in the space form, `--preload <path>`. In the gist's
-comments, Bedz01 reported that on bun 1.4.3 this form makes bun subcommands such as `bun install` fail with
-`Script not found "install"`, because `BUN_OPTIONS` reaches every `bun` on the machine. Flamerix's v3 switched to
-`--preload=<path>` for that reason. We have not reproduced it on Windows yet. Until a fix ships, run `bun` with
-`BUN_OPTIONS` cleared for that shell (`$env:BUN_OPTIONS = ''`), or choose Uninstall.
+It was a known issue in v1.0.0 and is **fixed in v1.0.1**. v1.0.0 wrote `BUN_OPTIONS` in the space form,
+`--preload <path>`. In the gist's comments, Bedz01 reported that on bun 1.4.3 this form makes bun subcommands such
+as `bun install` fail with `Script not found "install"`, because `BUN_OPTIONS` reaches every `bun` on the
+machine. We reproduced that on Windows with bun 1.4.3. With `--preload=<path>`, the form Flamerix's v3 also uses,
+`bun install` works and the hook still loads in Claude Code.
+
+**Upgrading from v1.0.0:** run the new script once with your current mode (e.g. `-Mode off`). It rewrites
+`BUN_OPTIONS` to the `=` form, keeps your mode, and doesn't start a new measurement period. `-Status` warns while
+the old form is still set. Terminals opened before the upgrade keep the old value, so open a new one before
+running `bun`.
 </details>
 
 <details><summary><b>Does the desktop app pick it up?</b></summary>
 
-**Untested.** The desktop app's Code tab runs its own bundled Claude Code, and whether it inherits your user
-environment is not documented. Quit and reopen the app, then check `-Status` for its process.
+Yes, as far as we've tested. See [The Claude desktop app](#the-claude-desktop-app). Fully quit and reopen it after
+a change. Cowork mode is probably not covered.
 </details>
 
 <details><summary><b>Is the cost in the report real money?</b></summary>
@@ -288,12 +327,15 @@ on Linux, reported working on macOS). This script is Windows-only. Only the unit
 
 | | Status |
 |---|---|
-| Hook on Windows, Claude Code 2.1.312: no hook / pass / off / slow | ✅ Replicate run, 5 / 5 / 0 / 2 |
+| Hook on Windows, Claude Code 2.1.312: no hook / pass / off / slow | ✅ Replicate run, 5 / 5 / 0 / 2 (v1.0.0, and again in v1.0.1 with the `--preload=` form) |
 | Logger capturing `agent_summary` requests by `query_source` | ✅ Matched the debug-log fork counts in the same run |
-| Unit tests: BUN_OPTIONS merge, number formatting under de-CH, periods, report | ✅ `pwsh test/unit.ps1`, 23/23 pass (run locally; no CI workflow yet) |
-| Script runs on Windows | ✅ The Replicate run above; parse-checked with PowerShell 7.4 |
+| `--preload=` form loads the hook (CLI 2.1.312 and desktop app's 2.1.309) and `bun install` works with it (bun 1.4.3) | ✅ v1.0.1, on Windows |
+| Upgrade from v1.0.0 (rewrites the space form, keeps the mode) | ✅ v1.0.1, on Windows |
+| Unit tests: BUN_OPTIONS merge and upgrade, version drift, path anonymising, number formatting under de-CH, periods, report | ✅ `pwsh test/unit.ps1`, 43/43 pass (run locally; no CI workflow yet) |
+| Script runs on Windows | ✅ Replicate, Status, upgrade and Report; parse-checked with Windows PowerShell 5.1 and PowerShell 7.6 |
+| Desktop app's bundled Claude Code (2.1.309) honouring `BUN_OPTIONS`: no hook / pass / off / slow | ✅ Replicate protocol against the bundled binary, 5 / 5 / 0 / 2. A live Code-tab session with the hook **not yet observed** |
 | Full first-time install flow on a fresh machine | ⚠️ **not yet tested.** Please report |
-| Desktop app's bundled CLI honouring `BUN_OPTIONS` | ⚠️ **not yet tested** |
+| Desktop app's Cowork mode | ⚠️ **probably not covered** (runs a separate Linux build in its own VM), untested |
 | Savings from slow mode over days of real use | ⚠️ **not yet measured.** [Share yours](https://github.com/omgapnt/claude-summary-tuner/issues/new?template=share-results.yml) |
 
 ## Repo layout
@@ -302,7 +344,7 @@ on Linux, reported working on macOS). This script is Windows-only. Only the unit
 Claude-Summary-Tuner.ps1   the single-file download (built from src/, CRLF, ASCII)
 src/                       hook.js, collector.ps1 and script parts; build.sh rebuilds the root script
 test/unit.ps1              unit tests (pwsh, synthetic data)
-test/fixtures/             sample report, our anonymised Windows replicate result
+test/fixtures/             sample report, our anonymised Windows and desktop-app replicate results
 docs/img/                  screenshots
 ```
 

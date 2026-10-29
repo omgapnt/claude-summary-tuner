@@ -1,0 +1,105 @@
+{
+  "t": "2026-10-29T19:59:01Z",
+  "what": "Flamerix 'Tested versions' A/B protocol run against the Claude DESKTOP app's bundled Claude Code binary",
+  "host": "MY-PC (Windows)",
+  "desktop_app": {
+    "version": "4.4212.0.0",
+    "package": "Claude_4.4212.0.0_x64__pzs8sxrjxfjjc (MSIX)",
+    "main_pid_started": "2026-10-29T19:37:36Z"
+  },
+  "bundled_cli": {
+    "version": "2.1.309",
+    "path": "C:\\Users\\you\\AppData\\Roaming\\Claude\\claude-code\\2.1.309\\9078b9c1d466\\claude.exe",
+    "sha256": "5441781f2b6bbd07354b4a74560ee88c68c9bf05d6db3c7e24c452c91673dc53",
+    "size": 298624160,
+    "signer": "Anthropic, PBC",
+    "bun": "1.4.4",
+    "bun_main": "B:/~BUN/root/cli",
+    "gate_matches": true,
+    "anchors": {
+      "[AgentSummary] Timer fired": 2,
+      "[AgentSummary] Forking": 2,
+      "agent_summary": 14
+    }
+  },
+  "protocol": {
+    "cmd": "claude -p <8 x sleep 20 subagent prompt> --model haiku --debug-file ... --setting-sources project --strict-mcp-config --permission-mode dontAsk --permission-prompts none --no-session-persistence --output-format json",
+    "env": {
+      "CLAUDE_CODE_AGENT_PROGRESS_SUMMARIES": "1",
+      "CLAUDE_CODE_SUBAGENT_MODEL": "haiku",
+      "DISABLE_AUTOUPDATER": "1"
+    },
+    "hook": "C:/Users/you/AppData/Local/cc-summary-tuner/no-agent-summary.js (tuner v1.0.0 embedded hook)",
+    "model": "claude-haiku-5-5",
+    "otel": "logs -> local tuner collector 127.0.0.1:47318, tagged cc_tuner.tag=desktop-20261029-205901-<arm>"
+  },
+  "result": {
+    "forks_nohook_pass_off": "5 / 5 / 0",
+    "fired_nohook_pass_off": "5 / 5 / 0",
+    "slow_1min": "forks 2, fired 2",
+    "otel_agent_summary_requests": "5 / 5 / 0 / 2",
+    "total_cost_usd": 0.028181045
+  },
+  "arms": {
+    "nohook": {
+      "forks": 5,
+      "fired": 5,
+      "shell_steps": 8,
+      "seconds": 185,
+      "cost_usd": 0.01126803,
+      "otel_agent_summary_requests": 5,
+      "otel_agent_summary_cost_usd": 0.001554205,
+      "hook_log": []
+    },
+    "pass": {
+      "forks": 5,
+      "fired": 5,
+      "shell_steps": 8,
+      "seconds": 185,
+      "cost_usd": 0.00646076,
+      "otel_agent_summary_requests": 5,
+      "otel_agent_summary_cost_usd": 0.001617355,
+      "hook_log": [
+        "preload active mode=pass bun=1.4.4",
+        "6 summary timers passed (control, delay=30000)",
+        "exit: 0 suppressed, 0 slowed, 6 matched"
+      ]
+    },
+    "off": {
+      "forks": 0,
+      "fired": 0,
+      "shell_steps": 8,
+      "seconds": 185,
+      "cost_usd": 0.004821985,
+      "otel_agent_summary_requests": 0,
+      "otel_agent_summary_cost_usd": 0.0,
+      "hook_log": [
+        "preload active mode=off bun=1.4.4",
+        "summary timer #1 suppressed (delay=30000)",
+        "exit: 1 suppressed, 0 slowed, 1 matched"
+      ]
+    },
+    "slow_1min": {
+      "forks": 2,
+      "fired": 2,
+      "shell_steps": 8,
+      "seconds": 186,
+      "cost_usd": 0.00563027,
+      "otel_agent_summary_requests": 2,
+      "otel_agent_summary_cost_usd": 0.00051653,
+      "hook_log": [
+        "preload active mode=slow min_delay=60000 bun=1.4.4",
+        "3 summary timers slowed (30000 -> 60000)",
+        "exit: 0 suppressed, 3 slowed, 3 matched"
+      ]
+    }
+  },
+  "env_passthrough": {
+    "desktop_main_process_env_has_hook_vars": true,
+    "desktop_code_session_env_builder": "{...process.env} plus desktop overrides (CLAUDE_CODE_ENTRYPOINT, auth, PATH, OTEL_SERVICE_NAME/RESOURCE_ATTRIBUTES); BUN_OPTIONS and CC_AGENT_SUMMARY_* not filtered; OTEL_EXPORTER_OTLP_* stripped only when an org-managed OTLP config exists",
+    "desktop_enables_summaries_via_sdk": "agentProgressSummaries passed in SDK initConfig",
+    "hook_log_desktop_spawn_evidence": [
+      "2026-10-29T19:37:47Z and 19:37:49Z: two short-lived processes loaded the hook (mode=off) ~11 s after the desktop app started; 0 timers matched"
+    ]
+  }
+}

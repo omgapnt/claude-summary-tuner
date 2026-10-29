@@ -4,8 +4,9 @@
   WHAT IT DOES
     Claude Code (v2.1.232+) re-sends each background agent's whole transcript to the model about every
     30 seconds, just to show a 3-5 word status in the agents panel ("agent_summary"). Flamerix AI measured
-    this at ~16% of all Claude Code spend. This script:
-      1. installs Flamerix's Bun --preload hook (embedded below) through the BUN_OPTIONS user variable,
+    this at ~16% of spend in their setup (Anthropic reports ~2% on average). This script:
+      1. installs Flamerix's Bun --preload hook (embedded below) through the BUN_OPTIONS user variable
+         (written as --preload=<path>, the form that does not break the standalone bun CLI),
          in one of these modes: baseline (hook counts only), slow (every 5 min or custom), off;
       2. optionally runs a tiny local logger that records Claude Code's own OpenTelemetry cost events
          (no prompt text, no e-mail) so you can measure before/after;
@@ -70,7 +71,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
 $ToolName = 'Claude-Summary-Tuner'
-$ToolVersion = '1.0.0'
+$ToolVersion = '1.0.1'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'cc-summary-tuner' }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -374,7 +375,7 @@ function Get-Config {
   $c = $null
   if (Test-Path -LiteralPath $ConfigPath) { try { $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } catch { $c = $null } }
   if (-not $c) { $c = New-Object PSObject }
-  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache') {
+  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache', 'ccVersions', 'desktopCcVersions', 'toolVersion') {
     if (-not $c.PSObject.Properties[$k]) { $c | Add-Member -NotePropertyName $k -NotePropertyValue $null }
   }
   return $c
@@ -415,9 +416,17 @@ function Remove-OurPreload([string]$s) {
   return ($keep -join ' ')
 }
 function Merge-BunOptions([string]$current, [string]$hookBunPath) {
+  # v1.0.1: always the '=' form. The space form ('--preload <path>') breaks standalone bun subcommands
+  # (bun install -> 'Script not found "install"', seen with bun 1.4.3), because BUN_OPTIONS reaches every bun.
   $rest = Remove-OurPreload $current
-  if ($rest) { return "$rest --preload $hookBunPath" }
-  return "--preload $hookBunPath"
+  if ($rest) { return "$rest --preload=$hookBunPath" }
+  return "--preload=$hookBunPath"
+}
+function Test-OldPreloadForm([string]$s) {
+  # True if BUN_OPTIONS holds our hook in the old space form (v1.0.0 or a manual install).
+  $t = @(Split-BunOptions $s)
+  for ($i = 0; $i -lt $t.Count - 1; $i++) { if ($t[$i] -eq '--preload' -and $t[$i + 1] -match 'no-agent-summary\.js$') { return $true } }
+  return $false
 }
 function Get-PreloadPaths([string]$s) {
   $t = @(Split-BunOptions $s); $o = @()
@@ -448,6 +457,34 @@ function Find-Claude {
   foreach ($p in $cands) { if ($p -like '*.exe') { return $p } }
   if ($cands.Count) { return $cands[0] }
   return $null
+}
+function Find-DesktopClaude {
+  # The Claude desktop app keeps its own Claude Code builds in %APPDATA%\Claude\claude-code\<version>\<hash>\claude.exe
+  $o = @(); if (-not $env:APPDATA) { return $o }
+  $root = Join-Path $env:APPDATA 'Claude\claude-code'
+  foreach ($v in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    $exe = Get-ChildItem -LiteralPath $v.FullName -Recurse -Filter 'claude.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exe) { $o += [pscustomobject]@{ Version = $v.Name; Path = $exe.FullName } }
+  }
+  return $o
+}
+function Get-VersionDrift($recorded, $current) {
+  # Versions present now that were not there when the mode was last set (the hook matches source strings,
+  # so a new build should be re-verified). Returns @() when nothing was recorded.
+  $r = @($recorded | Where-Object { $_ }); if (-not $r.Count) { return @() }
+  return @($current | Where-Object { $_ -and $_ -notin $r })
+}
+function Hide-UserPaths([string]$s) {
+  # Anonymises a text for sharing: user-profile paths become %USERPROFILE% etc., any C:\Users\<name> -> %USERNAME%.
+  if (-not $s) { return $s }
+  foreach ($v in @(@('LOCALAPPDATA', $env:LOCALAPPDATA), @('APPDATA', $env:APPDATA), @('TEMP', $env:TEMP), @('USERPROFILE', $env:USERPROFILE))) {
+    if (-not $v[1] -or $v[1].Length -lt 4) { continue }
+    foreach ($form in @($v[1], ($v[1] -replace '\\', '/'), ($v[1] -replace '/', '\\'))) { $s = [regex]::Replace($s, [regex]::Escape($form), "%$($v[0])%", 'IgnoreCase') }
+  }
+  $s = [regex]::Replace($s, '(?i)([A-Z]:(?:\\|/|\\\\)Users(?:\\|/|\\\\))[^\\/\s<>''"&;]+', '$1%USERNAME%')
+  if ($env:COMPUTERNAME -and $env:COMPUTERNAME.Length -ge 3) { $s = [regex]::Replace($s, '(?i)(?<![A-Za-z0-9])' + [regex]::Escape($env:COMPUTERNAME) + '(?![A-Za-z0-9])', '%COMPUTERNAME%') }
+  if ($env:USERNAME -and $env:USERNAME.Length -ge 3) { $s = [regex]::Replace($s, '(?i)(?<![A-Za-z0-9])' + [regex]::Escape($env:USERNAME) + '(?![A-Za-z0-9])', '%USERNAME%') }
+  return $s
 }
 function Invoke-Isolated([string]$exe, [string[]]$argv, [hashtable]$envOverride) {
   # Runs a child with extra/removed variables in THIS process only; nothing persistent is touched.
@@ -540,7 +577,7 @@ function Get-ClaudeProcesses($hookRows) {
     $kind = 'Session'; $relevant = $true
     if ($path -like '*\WindowsApps\Claude_*' -or $path -like '*\AnthropicClaude\*' -or $path -like '*\Programs\Claude\*') {
       if ($cmd -match '--type=') { continue }
-      $kind = 'Desktop app (restart it)'
+      $kind = 'Desktop app (main)'
     } elseif ($path -like '*\Claude\claude-code\*') { $kind = 'Desktop app Code session' }
     elseif ($cmd -match '\bdaemon\s+run') { $kind = 'Daemon' }
     elseif ($cmd -match '--bg-pty-host') { $kind = 'Daemon pty host' }
@@ -549,7 +586,7 @@ function Get-ClaudeProcesses($hookRows) {
     elseif ($cmd -match '\s--bg(\s|$)|bg-spare|--bg-session') { $kind = 'Background session' }
     $created = $null; if ($p.CreationDate) { $created = ([datetime]$p.CreationDate).ToUniversalTime() }
     $hook = '-'
-    if ($kind -ne 'Desktop app (restart it)') {
+    if ($kind -ne 'Desktop app (main)' -and $relevant) {
       $hook = 'NO'
       if ($hookRows -and $created) {
         $ln = $hookRows | Where-Object { $_.pid -eq $p.ProcessId -and $_.msg -like 'preload active*' -and $_.t -ge $created.AddSeconds(-10) } | Select-Object -Last 1
@@ -716,19 +753,38 @@ function Set-TunerMode([string]$m, [double]$min, [bool]$wantLogger, [bool]$inter
   Detect-Legacy $cfg
   $prevMode = $cfg.mode; $prevMin = $cfg.minutes
   $hookMode = @{ baseline = 'pass'; slow = 'slow'; off = 'off' }[$m]
-  $newBo = Merge-BunOptions (Get-UserEnv 'BUN_OPTIONS') $cfg.hookBunPath
+  $oldBo = Get-UserEnv 'BUN_OPTIONS'
+  $wasOldForm = Test-OldPreloadForm $oldBo
+  $newBo = Merge-BunOptions $oldBo $cfg.hookBunPath
+  if ($wasOldForm) { Say '  Rewriting BUN_OPTIONS from the old space form (--preload <path>) to --preload=<path> (fixes standalone bun install).' 'Yellow' }
+  $desk = @(Find-DesktopClaude)
   $test = Test-HookLoads $exe $newBo
   if (-not $test.ok) {
     Warn "Self-test failed: claude --version did not load the hook. Output: $($test.out)"
     Warn 'Nothing was changed.'; return
   }
   Good "  Self-test OK: $($test.line -replace '^\S+\s+pid=\d+\s+','')"
+  foreach ($d in $desk) {
+    $dt = Test-HookLoads $d.Path $newBo
+    if ($dt.ok) { Good "  Self-test OK for the desktop app's Claude Code $($d.Version)" } else { Warn "the desktop app's Claude Code $($d.Version) did not load the hook in the self-test: $($dt.out)" }
+  }
   Set-UserEnv 'BUN_OPTIONS' $newBo
   Set-UserEnv 'CC_AGENT_SUMMARY_MODE' $hookMode
   Set-UserEnv 'CC_AGENT_SUMMARY_LOG' $HookLogPath
   if ($hookMode -eq 'slow') { Set-UserEnv 'CC_AGENT_SUMMARY_MIN_DELAY_MS' ([string][int64]([Math]::Round($min * 60000))) } else { Set-UserEnv 'CC_AGENT_SUMMARY_MIN_DELAY_MS' $null }
-  $cfg.mode = $m; $cfg.minutes = $min; Save-Config $cfg
-  $id = Add-Journal 'mode' @{ mode = $m; minutes = $min; hook_mode = $hookMode; prev_mode = $prevMode; prev_minutes = $prevMin; cc_version = $ver; bun_options = $newBo }
+  $same = ($prevMode -eq $m) -and ([double]$prevMin -eq [double]$min) -and ((Get-UserEnv 'CC_AGENT_SUMMARY_MODE') -eq $hookMode)
+  $cfg.mode = $m; $cfg.minutes = $min; $cfg.ccVersions = @($ver); $cfg.desktopCcVersions = @($desk | ForEach-Object { $_.Version }); $cfg.toolVersion = $ToolVersion; Save-Config $cfg
+  if ($same) {
+    # Same mode as before (e.g. an upgrade): no new measurement period. Running processes already use the same hook
+    # file and mode, so no restart is needed for the summaries; only new processes see the rewritten BUN_OPTIONS.
+    $id = Add-Journal 'reapply' @{ mode = $m; minutes = $min; tool_version = $ToolVersion; cc_version = $ver; desktop_cc = ($cfg.desktopCcVersions -join ','); rewrote_old_form = $wasOldForm }
+    Good "  Mode unchanged; settings re-applied for $ToolName $ToolVersion. Logged at $(LocalStr (ParseIso $id))."
+    if ($wasOldForm) { Say '  Already running Claude Code processes keep working. Terminals opened before now still hold the old form, so open a new terminal before running bun.' }
+    if ($wantLogger -and -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port)))) { Enable-Logger $cfg $interactive | Out-Null }
+    elseif ($cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+    return
+  }
+  $id = Add-Journal 'mode' @{ mode = $m; minutes = $min; hook_mode = $hookMode; prev_mode = $prevMode; prev_minutes = $prevMin; cc_version = $ver; desktop_cc = ($cfg.desktopCcVersions -join ','); tool_version = $ToolVersion; bun_options = $newBo }
   Good "  Saved for your Windows account (user environment variables). Logged at $(LocalStr (ParseIso $id))."
   if ($wantLogger -and -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port)))) { Enable-Logger $cfg $interactive | Out-Null }
   elseif ($cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
@@ -753,6 +809,10 @@ function Get-StaleProcesses([datetime]$since) {
   $procs = Get-ClaudeProcesses (Read-HookLog $cfg)
   return @($procs | Where-Object { $_.Relevant -and $_.Started -and $_.Started -lt $since })
 }
+function Show-DesktopAdvice($procs) {
+  $d = @($procs | Where-Object { $_.Kind -like 'Desktop app*' })
+  if ($d.Count) { Say '  The Claude desktop app was started before the change: fully quit it (tray icon > Quit, not just closing the window) and open it again, so its Code tab gets the new setting.' 'Yellow' }
+}
 function Get-PendingModeAction {
   $j = Read-Journal; $last = $j | Where-Object { $_.action -in 'mode', 'uninstall' } | Select-Object -Last 1
   if (-not $last -or $last.action -ne 'mode') { return $null }
@@ -771,6 +831,7 @@ function Invoke-RestartCheck([string]$refId, [bool]$interactive) {
       return
     }
     Show-Processes $stale
+    Show-DesktopAdvice $stale
     if (-not $interactive) { Say "  $($stale.Count) old process(es) still running. Restart them, then run this script with -CheckRestart." 'Yellow'; return }
     $hasDaemon = [bool]($stale | Where-Object { $_.Kind -like 'Daemon*' -or $_.Kind -eq 'Background session' })
     Say '  [R] re-check   [D] stop the daemon now (ends background sessions)   [C] count from now anyway   [L] later (-CheckRestart)'
@@ -818,16 +879,33 @@ function Show-Status {
   Say "  BUN_OPTIONS        : $bo"
   $pre = Get-PreloadPaths $bo
   foreach ($p in $pre) { $ok = Test-Path -LiteralPath ($p -replace '/', '\'); Say "    preload $p -> $(if ($ok) { 'file exists' } else { 'MISSING FILE: Claude Code will fail to start!' })" $(if ($ok) { 'Gray' } else { 'Red' }) }
+  if (Test-OldPreloadForm $bo) {
+    $again = '-Mode baseline'; if ($cfg.mode -eq 'off') { $again = '-Mode off' } elseif ($cfg.mode -eq 'slow') { $again = "-Mode custom -Minutes $(Fmt ([double]$cfg.minutes))" }
+    Warn "BUN_OPTIONS uses the old space form (--preload <path>). It breaks standalone bun commands such as 'bun install' (Script not found). Re-run this script with $again to rewrite it as --preload=<path>; your mode stays the same."
+  }
   $exe = Find-Claude; $ver = Get-CCVersion $exe
   Say "  Claude Code        : $ver ($exe)"
-  $desk = @(Get-ChildItem -LiteralPath (Join-Path $env:APPDATA 'Claude\claude-code') -Directory -ErrorAction SilentlyContinue | ForEach-Object Name)
-  if ($desk.Count) { Say "  Desktop app CLI    : $($desk -join ', ') (bundled; runs Code-tab sessions)" }
-  if ($exe -and $exe -like '*.exe' -and $ver) {
-    $cache = @{}; if ($cfg.anchorCache) { foreach ($p in $cfg.anchorCache.PSObject.Properties) { $cache[$p.Name] = $p.Value } }
-    if (-not $cache.ContainsKey($ver)) { Say '  (scanning the binary for the summary timer anchor once for this version...)'; $a = Find-BinaryAnchors $exe; $cache[$ver] = [bool]$a['[AgentSummary] Timer fired']; $cfg.anchorCache = New-Object PSObject -Property $cache; Save-Config $cfg }
-    if ($cache[$ver]) { Good "  Static check       : anchor '[AgentSummary] Timer fired' present in $ver" } else { Warn "anchor '[AgentSummary] Timer fired' NOT found in $ver - the hook probably matches nothing now (fail-open)." }
+  $desk = @(Find-DesktopClaude)
+  if ($desk.Count) { Say "  Desktop app's CLI  : $(($desk | ForEach-Object { $_.Version }) -join ', ') (bundled with the Claude desktop app; runs its Code-tab sessions)" }
+  $cache = @{}; if ($cfg.anchorCache) { foreach ($p in $cfg.anchorCache.PSObject.Properties) { $cache[$p.Name] = $p.Value } }
+  $bins = @(); if ($exe -and $exe -like '*.exe' -and $ver) { $bins += [pscustomobject]@{ Label = "$ver"; Version = $ver; Path = $exe } }
+  foreach ($d in $desk) { $bins += [pscustomobject]@{ Label = "$($d.Version) (desktop app)"; Version = $d.Version; Path = $d.Path } }
+  foreach ($b in $bins) {
+    if (-not $cache.ContainsKey($b.Version)) { Say "  (scanning $($b.Label) for the summary timer anchor once...)"; $a = Find-BinaryAnchors $b.Path; $cache[$b.Version] = [bool]$a['[AgentSummary] Timer fired']; $cfg.anchorCache = New-Object PSObject -Property $cache; Save-Config $cfg }
+    if ($cache[$b.Version]) { Good "  Static check       : anchor '[AgentSummary] Timer fired' present in $($b.Label)" } else { Warn "anchor '[AgentSummary] Timer fired' NOT found in $($b.Label) - the hook probably matches nothing there (fail-open)." }
   }
-  if ($cfg.mode -and $bo) { $t = Test-HookLoads $exe $bo; if ($t.ok) { Good '  Hook load test     : OK' } else { Warn "hook does NOT load with the saved BUN_OPTIONS: $($t.out)" } }
+  if ($cfg.mode -and $bo) {
+    foreach ($b in $bins) { $t = Test-HookLoads $b.Path $bo; if ($t.ok) { Good "  Hook load test     : OK ($($b.Label))" } else { Warn "hook does NOT load in $($b.Label) with the saved BUN_OPTIONS: $($t.out)" } }
+  }
+  if ($cfg.mode) {
+    # Version drift: the hook matches source strings, so a Claude Code build it was never checked against may not match.
+    $recCli = @($cfg.ccVersions); $recDesk = @($cfg.desktopCcVersions)
+    if (-not ($recCli | Where-Object { $_ })) { $lm = Read-Journal | Where-Object { $_.action -in 'mode', 'reapply' -and $_.cc_version } | Select-Object -Last 1; if ($lm) { $recCli = @($lm.cc_version) } }
+    $drift = @(Get-VersionDrift $recCli @($ver))
+    if ($recDesk | Where-Object { $_ }) { $drift += @(Get-VersionDrift $recDesk @($desk | ForEach-Object { $_.Version }) | ForEach-Object { "$_ (desktop app)" }) }
+    if ($drift.Count) { Warn "Claude Code changed since the mode was set (then: $((@($recCli) + @($recDesk) | Where-Object { $_ } | Select-Object -Unique) -join ', '); new: $($drift -join ', ')). The hook matches text inside the program, so re-verify with -Replicate (about `$0.03 of Haiku). Nothing was changed." }
+    else { Say "  Version check      : same Claude Code version(s) as when the mode was set" }
+  }
   $h = Get-CollectorHealth ([int]$cfg.port)
   $run = (Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue).$RunValueName
   Say "  Logger             : $(if ($cfg.loggerEnabled) { 'on' } else { 'off' }), port $($cfg.port), autostart $(if ($run) { 'yes' } else { 'no' }), $(if ($h) { "running (PID $($h.pid), $($h.stored) events stored since start)" } else { 'NOT running' })"
@@ -851,8 +929,15 @@ function Show-Status {
   $procs = Get-ClaudeProcesses $hr
   Head 'Running Claude processes'
   Show-Processes $procs
-  $unhooked = @($procs | Where-Object { $_.Relevant -and $_.Hook -eq 'NO' -and $_.Kind -ne 'Desktop app (restart it)' })
+  $unhooked = @($procs | Where-Object { $_.Relevant -and $_.Hook -eq 'NO' -and $_.Kind -ne 'Desktop app (main)' })
   if ($cfg.mode -and $unhooked.Count) { Warn "$($unhooked.Count) Claude Code process(es) run WITHOUT the hook (started before the install, from an old terminal, or BUN_OPTIONS did not reach them)." }
+  $lastChange = Read-Journal | Where-Object { $_.action -eq 'mode' } | Select-Object -Last 1
+  if ($cfg.mode -and $lastChange) {
+    $since = ParseIso $lastChange.t
+    $oldDesk = @($procs | Where-Object { $_.Kind -eq 'Desktop app (main)' -and $_.Started -and $_.Started -lt $since })
+    if ($oldDesk.Count) { Warn "the Claude desktop app was started before the last mode change ($(LocalStr $since)). Fully quit it (tray icon > Quit) and open it again so its Code tab uses the new setting." }
+    elseif (@($procs | Where-Object { $_.Kind -eq 'Desktop app (main)' }).Count) { Say "  Desktop app        : started after the last mode change, so its Code tab inherits the current setting" }
+  }
   $conf = Get-OtelConflicts $cfg
   if ($conf.Count) { Say '  Other telemetry settings found:' 'Yellow'; $conf | ForEach-Object { Say "   - $_" 'Yellow' } }
 }
@@ -868,7 +953,7 @@ function Invoke-Uninstall([bool]$interactive) {
   $bo = Get-UserEnv 'BUN_OPTIONS'
   if ($bo) { $rest = Remove-OurPreload $bo; Set-UserEnv 'BUN_OPTIONS' $rest; if ($rest) { Say "  BUN_OPTIONS kept with: $rest" } else { Say '  BUN_OPTIONS removed' } }
   foreach ($k in $TunerVars) { if (Get-UserEnv $k) { Set-UserEnv $k $null; Say "  removed $k" } }
-  $running = @(Get-ClaudeProcesses $null | Where-Object { $_.Relevant -and $_.Kind -ne 'Desktop app (restart it)' })
+  $running = @(Get-ClaudeProcesses $null | Where-Object { $_.Relevant -and $_.Kind -ne 'Desktop app (main)' })
   $stub = "// Removed by $ToolName. Running Claude Code processes may still list this file in BUN_OPTIONS;`n// it does nothing. Delete it after every Claude Code process has been restarted.`n"
   foreach ($hp in @($cfg.hookPath)) {
     if (-not $hp -or -not (Test-Path -LiteralPath $hp)) { continue }
@@ -989,9 +1074,10 @@ function New-Report {
   # ---- HTML
   $script:markerLegend = ''
   $sb = New-Object Text.StringBuilder
-  $title = "Claude Code agent_summary report - $env:COMPUTERNAME - $(LocalStr (NowUtc))"
+  # v1.0.1: no PC name and no user name in the report, so it can be shared as is (paths are shown as %LOCALAPPDATA% etc.).
+  $title = "Claude Code agent_summary report - $(LocalStr (NowUtc))"
   [void]$sb.Append("<!doctype html><html><head><meta charset='utf-8'><title>$(HtmlEnc $title)</title><style>body{background:#14161c;color:#e6e6e6;font:14px/1.5 'Segoe UI',Arial,sans-serif;margin:24px auto;max-width:1040px;padding:0 16px}h1{font-size:22px}h2{font-size:17px;margin-top:32px;border-bottom:1px solid #333;padding-bottom:4px}table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border-bottom:1px solid #2a2d36;padding:5px 8px;text-align:right;font-variant-numeric:tabular-nums}th{color:#aab;font-weight:600;background:#1b1e26;font-size:12px}table{font-size:13px}td:first-child,th:first-child{text-align:left}.warn{color:#ffca28}.muted{color:#8a8f9c}.card{display:inline-block;background:#1b1e26;border-radius:8px;padding:10px 16px;margin:4px 8px 4px 0}.card b{font-size:20px;display:block}code{background:#222;padding:1px 4px;border-radius:3px}ul{margin:4px 0}</style></head><body>")
-  [void]$sb.Append("<h1>$(HtmlEnc $title)</h1><p class='muted'>Generated by $ToolName $ToolVersion. Data folder: <code>$(HtmlEnc $DataDir)</code>. Times are local ($(HtmlEnc ([TimeZoneInfo]::Local.Id))).</p>")
+  [void]$sb.Append("<h1>$(HtmlEnc $title)</h1><p class='muted'>Generated by $ToolName $ToolVersion. Data folder: <code>$(HtmlEnc (Hide-UserPaths $DataDir))</code>. Times are local ($(HtmlEnc ([TimeZoneInfo]::Local.Id))).</p>")
   $tc = ($req | Measure-Object cost -Sum).Sum; if (-not $tc) { $tc = 0 }
   $asAll = @($req | Where-Object { $_.qs -eq 'agent_summary' }); $ac = ($asAll | Measure-Object cost -Sum).Sum; if (-not $ac) { $ac = 0 }
   [void]$sb.Append("<div><span class='card'>API requests<b>$($req.Count)</b></span><span class='card'>Est. cost<b>$(HtmlEnc (Money $tc))</b></span><span class='card'>agent_summary requests<b>$($asAll.Count) ($(Pct $asAll.Count $req.Count))</b></span><span class='card'>agent_summary est. cost<b>$(HtmlEnc (Money $ac)) ($(Pct $ac $tc))</b></span></div>")
@@ -1025,15 +1111,15 @@ function New-Report {
     [void]$sb.Append("<h2>Replicate runs (Flamerix 'Tested versions' protocol)</h2><table><tr><th>When</th><th>version</th><th>sha256</th><th>static</th><th>summary forks: no hook / pass / off</th><th>timer fired</th><th>slow arm</th><th>agent_summary requests (telemetry)</th><th>est. cost</th><th>debug files</th></tr>")
     foreach ($f in $reps) {
       try { $r = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-      [void]$sb.Append("<tr><td>$(HtmlEnc (LocalStr (ParseIso $r.t)))</td><td>$(HtmlEnc $r.version)</td><td><code>$(HtmlEnc $r.sha12)</code></td><td>$(HtmlEnc $r.static)</td><td><b>$(HtmlEnc $r.forks)</b></td><td>$(HtmlEnc $r.fired)</td><td>$(HtmlEnc $r.slow)</td><td>$(HtmlEnc $r.telemetry)</td><td>$(HtmlEnc $r.cost)</td><td class='muted' style='text-align:left'>$(HtmlEnc $f.DirectoryName)</td></tr>")
+      [void]$sb.Append("<tr><td>$(HtmlEnc (LocalStr (ParseIso $r.t)))</td><td>$(HtmlEnc $r.version)</td><td><code>$(HtmlEnc $r.sha12)</code></td><td>$(HtmlEnc $r.static)</td><td><b>$(HtmlEnc $r.forks)</b></td><td>$(HtmlEnc $r.fired)</td><td>$(HtmlEnc $r.slow)</td><td>$(HtmlEnc $r.telemetry)</td><td>$(HtmlEnc $r.cost)</td><td class='muted' style='text-align:left'>$(HtmlEnc (Hide-UserPaths $f.DirectoryName))</td></tr>")
     }
     [void]$sb.Append("</table><p class='muted'>Flamerix's published row for 2.1.312: 5 / 5 / 0.</p>")
   }
   [void]$sb.Append('<h2>Action journal</h2><table><tr><th>When</th><th>Action</th><th>Details</th></tr>')
-  foreach ($a in $journal) { $d = ($a.PSObject.Properties | Where-Object { $_.Name -notin 't', 'action', 'bun_options' -and $null -ne $_.Value -and "$($_.Value)" -ne '' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; '; [void]$sb.Append("<tr><td>$(HtmlEnc (LocalStr (ParseIso $a.t)))</td><td>$(HtmlEnc $a.action)</td><td style='text-align:left'>$(HtmlEnc $d)</td></tr>") }
-  [void]$sb.Append("</table><h2>Caveats</h2><ul><li><b>cost_usd is Claude Code's own estimate</b> at API list prices, not an invoice. On a Pro/Max subscription it stands for rate-limit headroom you use up, not money.</li><li>Periods differ in workload. Compare per-active-hour numbers and the agent_summary <i>share</i>, and collect a few days per period. The summary only runs while background agents/subagents run.</li><li><b>Fail-open:</b> a Claude Code update can rename what the hook looks for. Then summaries silently come back. Check the CC versions column, the hook evidence table and run <code>-Status</code> / <code>-Replicate</code> after updates.</li><li>Processes that started before a change keep the old setting; periods start only when none was left (or when you confirmed). The Claude desktop app's Code tab runs its own bundled Claude Code; whether it passes your user environment through is not documented - check the process table in <code>-Status</code> for 'Hook loaded'.</li><li>The logger stores only: time, event type, session id, model, query_source, token counts, cost estimate, duration, Claude Code version and agent type. No prompts, responses, e-mail or account ids. Only what reaches 127.0.0.1 on this PC.</li><li>Unofficial tool; changing client behaviour may conflict with the service terms. Hook (c) Flamerix AI, MIT.</li></ul></body></html>")
+  foreach ($a in $journal) { $d = ($a.PSObject.Properties | Where-Object { $_.Name -notin 't', 'action', 'bun_options' -and $null -ne $_.Value -and "$($_.Value)" -ne '' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join '; '; [void]$sb.Append("<tr><td>$(HtmlEnc (LocalStr (ParseIso $a.t)))</td><td>$(HtmlEnc $a.action)</td><td style='text-align:left'>$(HtmlEnc (Hide-UserPaths $d))</td></tr>") }
+  [void]$sb.Append("</table><h2>Caveats</h2><ul><li><b>cost_usd is Claude Code's own estimate</b> at API list prices, not an invoice. On a Pro/Max subscription it stands for rate-limit headroom you use up, not money.</li><li>Periods differ in workload. Compare per-active-hour numbers and the agent_summary <i>share</i>, and collect a few days per period. The summary only runs while background agents/subagents run.</li><li><b>Fail-open:</b> a Claude Code update can rename what the hook looks for. Then summaries silently come back. Check the CC versions column, the hook evidence table and run <code>-Status</code> / <code>-Replicate</code> after updates.</li><li>Processes that started before a change keep the old setting; periods start only when none was left (or when you confirmed). The Claude desktop app's Code tab runs its own bundled Claude Code (in %APPDATA%\Claude\claude-code), which inherits BUN_OPTIONS from the app; the app must be fully quit and reopened after a change. Cowork mode runs in its own VM and is probably not covered.</li><li>The logger stores only: time, event type, session id, model, query_source, token counts, cost estimate, duration, Claude Code version and agent type. No prompts, responses, e-mail or account ids. Only what reaches 127.0.0.1 on this PC.</li><li>Unofficial tool; changing client behaviour may conflict with the service terms. Hook (c) Flamerix AI, MIT.</li></ul></body></html>")
   $out = $ReportTo; if (-not $out) { $out = Join-Path $DataDir ('report-' + (Get-Date).ToString('yyyyMMdd-HHmm', $Inv) + '.html') }
-  Ensure-Dir (Split-Path $out -Parent); Write-Text $out $sb.ToString()
+  Ensure-Dir (Split-Path $out -Parent); Write-Text $out (Hide-UserPaths $sb.ToString())   # safety net for any path left
   Good "  HTML report: $out"
   if (-not $NoOpen) { try { Invoke-Item -LiteralPath $out } catch {} }
   return $out
@@ -1144,6 +1230,7 @@ function Show-Menu {
   Write-Host '  Unofficial; may conflict with service terms; MIT, hook (c) Flamerix AI. Fails open after updates.' -ForegroundColor DarkGray
   $cur = 'not installed'; if ($cfg.mode) { $cur = Get-ModeLabel $cfg.mode ([double]$cfg.minutes) }
   Write-Host "  Current: $cur; logger $(if ($cfg.loggerEnabled) { 'on' } else { 'off' })" -ForegroundColor DarkGray
+  if ($cfg.mode -and (Test-OldPreloadForm (Get-UserEnv 'BUN_OPTIONS'))) { Write-Host '  Upgrade note: choose your current mode again once to rewrite BUN_OPTIONS as --preload=<path> (fixes standalone bun install).' -ForegroundColor Yellow }
   Write-Host ''
   Write-Host '   1  Baseline - measure only (hook counts, summaries unchanged) + logger'
   Write-Host '   2  Slow     - one summary per agent at most every 5 minutes'

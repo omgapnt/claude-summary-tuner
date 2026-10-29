@@ -104,6 +104,7 @@ function Show-Menu {
   Write-Host '  Unofficial; may conflict with service terms; MIT, hook (c) Flamerix AI. Fails open after updates.' -ForegroundColor DarkGray
   $cur = 'not installed'; if ($cfg.mode) { $cur = Get-ModeLabel $cfg.mode ([double]$cfg.minutes) }
   Write-Host "  Current: $cur; logger $(if ($cfg.loggerEnabled) { 'on' } else { 'off' })" -ForegroundColor DarkGray
+  if ($cfg.mode -and (Test-OldPreloadForm (Get-UserEnv 'BUN_OPTIONS'))) { Write-Host '  Upgrade note: choose your current mode again once to rewrite BUN_OPTIONS as --preload=<path> (fixes standalone bun install).' -ForegroundColor Yellow }
   Write-Host ''
   Write-Host '   1  Baseline - measure only (hook counts, summaries unchanged) + logger'
   Write-Host '   2  Slow     - one summary per agent at most every 5 minutes'

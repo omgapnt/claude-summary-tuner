@@ -47,7 +47,7 @@ function Get-Config {
   $c = $null
   if (Test-Path -LiteralPath $ConfigPath) { try { $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } catch { $c = $null } }
   if (-not $c) { $c = New-Object PSObject }
-  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache') {
+  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache', 'ccVersions', 'desktopCcVersions', 'toolVersion') {
     if (-not $c.PSObject.Properties[$k]) { $c | Add-Member -NotePropertyName $k -NotePropertyValue $null }
   }
   return $c
@@ -88,9 +88,17 @@ function Remove-OurPreload([string]$s) {
   return ($keep -join ' ')
 }
 function Merge-BunOptions([string]$current, [string]$hookBunPath) {
+  # v1.0.1: always the '=' form. The space form ('--preload <path>') breaks standalone bun subcommands
+  # (bun install -> 'Script not found "install"', seen with bun 1.4.3), because BUN_OPTIONS reaches every bun.
   $rest = Remove-OurPreload $current
-  if ($rest) { return "$rest --preload $hookBunPath" }
-  return "--preload $hookBunPath"
+  if ($rest) { return "$rest --preload=$hookBunPath" }
+  return "--preload=$hookBunPath"
+}
+function Test-OldPreloadForm([string]$s) {
+  # True if BUN_OPTIONS holds our hook in the old space form (v1.0.0 or a manual install).
+  $t = @(Split-BunOptions $s)
+  for ($i = 0; $i -lt $t.Count - 1; $i++) { if ($t[$i] -eq '--preload' -and $t[$i + 1] -match 'no-agent-summary\.js$') { return $true } }
+  return $false
 }
 function Get-PreloadPaths([string]$s) {
   $t = @(Split-BunOptions $s); $o = @()
@@ -121,6 +129,34 @@ function Find-Claude {
   foreach ($p in $cands) { if ($p -like '*.exe') { return $p } }
   if ($cands.Count) { return $cands[0] }
   return $null
+}
+function Find-DesktopClaude {
+  # The Claude desktop app keeps its own Claude Code builds in %APPDATA%\Claude\claude-code\<version>\<hash>\claude.exe
+  $o = @(); if (-not $env:APPDATA) { return $o }
+  $root = Join-Path $env:APPDATA 'Claude\claude-code'
+  foreach ($v in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    $exe = Get-ChildItem -LiteralPath $v.FullName -Recurse -Filter 'claude.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exe) { $o += [pscustomobject]@{ Version = $v.Name; Path = $exe.FullName } }
+  }
+  return $o
+}
+function Get-VersionDrift($recorded, $current) {
+  # Versions present now that were not there when the mode was last set (the hook matches source strings,
+  # so a new build should be re-verified). Returns @() when nothing was recorded.
+  $r = @($recorded | Where-Object { $_ }); if (-not $r.Count) { return @() }
+  return @($current | Where-Object { $_ -and $_ -notin $r })
+}
+function Hide-UserPaths([string]$s) {
+  # Anonymises a text for sharing: user-profile paths become %USERPROFILE% etc., any C:\Users\<name> -> %USERNAME%.
+  if (-not $s) { return $s }
+  foreach ($v in @(@('LOCALAPPDATA', $env:LOCALAPPDATA), @('APPDATA', $env:APPDATA), @('TEMP', $env:TEMP), @('USERPROFILE', $env:USERPROFILE))) {
+    if (-not $v[1] -or $v[1].Length -lt 4) { continue }
+    foreach ($form in @($v[1], ($v[1] -replace '\\', '/'), ($v[1] -replace '/', '\\'))) { $s = [regex]::Replace($s, [regex]::Escape($form), "%$($v[0])%", 'IgnoreCase') }
+  }
+  $s = [regex]::Replace($s, '(?i)([A-Z]:(?:\\|/|\\\\)Users(?:\\|/|\\\\))[^\\/\s<>''"&;]+', '$1%USERNAME%')
+  if ($env:COMPUTERNAME -and $env:COMPUTERNAME.Length -ge 3) { $s = [regex]::Replace($s, '(?i)(?<![A-Za-z0-9])' + [regex]::Escape($env:COMPUTERNAME) + '(?![A-Za-z0-9])', '%COMPUTERNAME%') }
+  if ($env:USERNAME -and $env:USERNAME.Length -ge 3) { $s = [regex]::Replace($s, '(?i)(?<![A-Za-z0-9])' + [regex]::Escape($env:USERNAME) + '(?![A-Za-z0-9])', '%USERNAME%') }
+  return $s
 }
 function Invoke-Isolated([string]$exe, [string[]]$argv, [hashtable]$envOverride) {
   # Runs a child with extra/removed variables in THIS process only; nothing persistent is touched.
