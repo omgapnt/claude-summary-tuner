@@ -8,8 +8,17 @@
 [![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)](#quick-start)
 [![Claude Code 2.1.312 tested](https://img.shields.io/badge/Claude%20Code-2.1.312%20tested-D97757)](#replicate-the-flamerix-test)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/omgapnt/claude-summary-tuner?color=D97757)](https://github.com/omgapnt/claude-summary-tuner/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/omgapnt/claude-summary-tuner/total?color=555)](https://github.com/omgapnt/claude-summary-tuner/releases)
 
 **One file · no admin · no Node · fully undoable · measure first, then change**
+
+```powershell
+irm https://github.com/omgapnt/claude-summary-tuner/releases/latest/download/Claude-Summary-Tuner.ps1 -OutFile Claude-Summary-Tuner.ps1
+powershell -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1
+```
+
+<sub>Windows port of <a href="https://gist.github.com/flamerix-ai/c3905705cc4205e5de3011fa2e74efce">Flamerix's <code>no-agent-summary.js</code></a>, whose path check never matches on Windows. If this saves you tokens, a ⭐ helps other Windows users find it.</sub>
 
 <img src="docs/img/report-hero.png" alt="HTML report comparing a baseline period with a 'slow 5 min' period" width="820">
 
@@ -29,6 +38,10 @@
   **16.4 % of all Claude Code spend** over one week, which was more than their main conversation (15.7 %).
   [anthropics/claude-code#86879](https://github.com/anthropics/claude-code/issues/86879) collects other reports of
   18-26 %. Your share depends on how much you use agents.
+- A Claude Code engineer [replied on Hacker News](https://news.ycombinator.com/item?id=50284255) that across users who
+  send telemetry, `agent_summary` was about **2 % of cost** (about **6 %** in the terminal) the week before, that a fix
+  for summaries missing the prompt cache shipped in **2.1.311+**, and that a cheaper mode is in the works. Heavy
+  background-agent users are the ones who pay most, and measuring your own share is what this tool is for.
 - There is **no setting** to turn it off. Flamerix published a small Bun `--preload` hook that does. It was
   tested on Linux and reported working on macOS, but **its gate never fires on Windows**. On Windows, Bun's
   `Bun.main` is `B:/~BUN/root/cli`, not `/$bunfs/root/cli`.
@@ -49,10 +62,11 @@
 In PowerShell (Windows PowerShell 5.1 or PowerShell 7, **no admin**):
 
 ```powershell
-irm https://raw.githubusercontent.com/omgapnt/claude-summary-tuner/main/Claude-Summary-Tuner.ps1 -OutFile Claude-Summary-Tuner.ps1
+irm https://github.com/omgapnt/claude-summary-tuner/releases/latest/download/Claude-Summary-Tuner.ps1 -OutFile Claude-Summary-Tuner.ps1
 powershell -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1
 ```
 
+Or download `Claude-Summary-Tuner.ps1` from the [latest release](https://github.com/omgapnt/claude-summary-tuner/releases/latest).
 Pick an option from the menu. Then **close and restart every Claude Code session** (see
 [Restart everything](#-restart-everything-after-every-change)).
 
@@ -243,6 +257,15 @@ summaries silently come back, and nothing breaks. After every update, run `-Repl
 anchors no longer match.
 </details>
 
+<details><summary><b>I also use the standalone <code>bun</code> CLI. Anything to know?</b></summary>
+
+Yes, a known issue in v1.0.0. The script writes `BUN_OPTIONS` in the space form, `--preload <path>`. In the gist's
+comments, Bedz01 reported that on bun 1.4.3 this form makes bun subcommands such as `bun install` fail with
+`Script not found "install"`, because `BUN_OPTIONS` reaches every `bun` on the machine. Flamerix's v3 switched to
+`--preload=<path>` for that reason. We have not reproduced it on Windows yet. Until a fix ships, run `bun` with
+`BUN_OPTIONS` cleared for that shell (`$env:BUN_OPTIONS = ''`), or choose Uninstall.
+</details>
+
 <details><summary><b>Does the desktop app pick it up?</b></summary>
 
 **Untested.** The desktop app's Code tab runs its own bundled Claude Code, and whether it inherits your user
@@ -257,8 +280,8 @@ headroom you use up.
 
 <details><summary><b>macOS / Linux?</b></summary>
 
-Use [Flamerix's gist](https://gist.github.com/flamerix-ai/c3905705cc4205e5de3011fa2e74efce) directly. This
-script is Windows-only. Only the unit tests run cross-platform.
+Use [Flamerix's gist](https://gist.github.com/flamerix-ai/c3905705cc4205e5de3011fa2e74efce) directly (v3, tested
+on Linux, reported working on macOS). This script is Windows-only. Only the unit tests run cross-platform.
 </details>
 
 ## What's tested and what isn't
@@ -267,7 +290,7 @@ script is Windows-only. Only the unit tests run cross-platform.
 |---|---|
 | Hook on Windows, Claude Code 2.1.312: no hook / pass / off / slow | ✅ Replicate run, 5 / 5 / 0 / 2 |
 | Logger capturing `agent_summary` requests by `query_source` | ✅ Matched the debug-log fork counts in the same run |
-| Unit tests: BUN_OPTIONS merge, number formatting under de-CH, periods, report | ✅ `pwsh test/unit.ps1`, 23/23 pass. A GitHub Actions workflow runs them on Linux |
+| Unit tests: BUN_OPTIONS merge, number formatting under de-CH, periods, report | ✅ `pwsh test/unit.ps1`, 23/23 pass (run locally; no CI workflow yet) |
 | Script runs on Windows | ✅ The Replicate run above; parse-checked with PowerShell 7.4 |
 | Full first-time install flow on a fresh machine | ⚠️ **not yet tested.** Please report |
 | Desktop app's bundled CLI honouring `BUN_OPTIONS` | ⚠️ **not yet tested** |
