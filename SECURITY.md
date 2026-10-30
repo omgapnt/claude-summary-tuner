@@ -85,6 +85,9 @@ gone.
   gate) and does nothing otherwise, but it is still loaded.
 - **Telemetry variables are user-wide.** When the logger is on, the four variables above apply to every Claude Code
   process of your Windows account.
+- **After an upgrade the running logger keeps its old code.** Running your mode again replaces `collector.ps1` on
+  disk, but a logger that is already running is not restarted. It runs the old copy until you sign out, or until
+  you run `-Logger off` and then `-Logger on` (add `-Autostart on` to keep autostart).
 - The data folder must be writable only by you. Do not point `-DataDir` at a shared folder.
 - Not signed. Windows SmartScreen and Defender judge it by reputation only.
 

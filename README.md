@@ -68,11 +68,22 @@ powershell -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1
 ```
 
 Or download `Claude-Summary-Tuner.ps1` from the [latest release](https://github.com/omgapnt/claude-summary-tuner/releases/latest).
-Pick an option from the menu. Then **close and restart every Claude Code session** (see
+Want to check it first? See [Is this safe?](#is-this-safe) below. Pick an option from the menu (`Q` quits without
+changing anything). Then **close and restart every Claude Code session** (see
 [Restart everything](#-restart-everything-after-every-change)).
 
-> **Upgrading from v1.0.0?** Run the new script once with your current mode (e.g. `-Mode off`). It switches
-> `BUN_OPTIONS` to the `--preload=` form, which fixes standalone `bun install`, and keeps your mode and data.
+> **Running the other commands in this README:** they are written as `.\Claude-Summary-Tuner.ps1 -Status` and so on.
+> Windows' default execution policy blocks unsigned scripts, and a file downloaded with a browser is blocked under
+> `RemoteSigned` too. If you see "running scripts is disabled", put
+> `powershell -ExecutionPolicy Bypass -File` in front: `powershell -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1 -Status`.
+> That bypass applies to this one run only.
+
+> **Upgrading from v1.0.0 or v1.0.1?** Run the new script once with your current mode, e.g. `-Mode off`. It keeps
+> your mode, logger, autostart and data, replaces the hook and logger files, and rewrites an old-form
+> `BUN_OPTIONS` (`--preload <path>`, which broke standalone `bun install`) as `--preload=<path>`. A logger that is
+> already running keeps running the old copy until you sign out. To restart it now with the new copy, run
+> `-Logger off` and then `-Logger on -Autostart on` (leave out `-Autostart on` if you don't want it to start at
+> logon). Afterwards `-Verify` ends with `Verify: OK`.
 
 > Read the script before you run it. It is one plain-text file, and the hook is embedded near the top as `$HookJs`.
 
@@ -84,13 +95,43 @@ Pick an option from the menu. Then **close and restart every Claude Code session
 
 It is an unaudited, unsigned hobby script that puts a hook into Claude Code, so check it before you run it:
 
-1. **Download** `Claude-Summary-Tuner.ps1` and `SHA256SUMS` from the
-   [release page](https://github.com/omgapnt/claude-summary-tuner/releases) instead of piping anything into a shell.
+1. **Download** the script and `SHA256SUMS` into a folder (nothing is run yet):
+
+   ```powershell
+   irm https://github.com/omgapnt/claude-summary-tuner/releases/latest/download/Claude-Summary-Tuner.ps1 -OutFile Claude-Summary-Tuner.ps1
+   irm https://github.com/omgapnt/claude-summary-tuner/releases/latest/download/SHA256SUMS -OutFile SHA256SUMS
+   ```
+
 2. **Inspect** it. It is one plain-text file with no encoded parts. The hook (`$HookJs`) and the logger
    (`$CollectorPs`) are near the top, and the header lists everything the script can change.
-3. **Verify the hash.** `Get-FileHash .\Claude-Summary-Tuner.ps1 -Algorithm SHA256` must match `SHA256SUMS`, or run
-   `.\Claude-Summary-Tuner.ps1 -Verify -ExpectedHash <sha256>` (read-only).
-4. **Dry run.** `.\Claude-Summary-Tuner.ps1 -Mode off -WhatIf` shows what it would change, and changes nothing.
+3. **Check the hash.** `Get-FileHash` prints it in upper case and `SHA256SUMS` in lower case. PowerShell's `-eq`
+   ignores case, so this prints `True` when they match:
+
+   ```powershell
+   (Get-FileHash .\Claude-Summary-Tuner.ps1 -Algorithm SHA256).Hash -eq (Get-Content .\SHA256SUMS).Split(' ')[0]
+   ```
+
+   Or let the script check itself (read-only, accepts either case):
+
+   ```text
+   PS> powershell -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1 -Verify -ExpectedHash d889447f...
+   == Claude-Summary-Tuner 1.0.2 - verify (read-only) ==
+     SHA256             : d889447f33d1ba345b971756fc5f58ea3fd727f47ea0b5d590ef975b5813103c
+     Matches -ExpectedHash.
+     Authenticode       : NotSigned (the script is not code-signed; the SHA256 above is how you check it)
+     Embedded hook      : sha256 d42e4b2b... (equals sha256 of src/hook.js in the repo at tag v1.0.2)
+     hook file on disk : identical to the copy embedded in this file (...)
+     logger script on disk : identical to the copy embedded in this file (...)
+     Verify: OK
+   ```
+
+   Exit code 0 means everything matched. It exits 1 if the hash differs, and also if the hook or logger file
+   already installed on your PC differs from the copies in this script. Right after downloading v1.0.2 over an
+   older install that is expected: it warns `logger script on disk differs`, and running your mode once fixes it.
+4. **Dry run.** Add `-WhatIf` to any command, e.g. `-Mode off -WhatIf`. It lists what the tool can touch, the
+   current state (variable *names* only, `set` / `not set`) and the kinds of change the command would make, then
+   ends with `No child process, socket, or write was performed.` It does not run Claude Code, so it cannot show
+   results of the self-tests.
 5. **Run** it.
 
 [SECURITY.md](SECURITY.md) lists every file, variable, registry value, process and port it touches, the known
@@ -111,6 +152,7 @@ issues, and how to report a problem.
 | 9 | Logger on/off | Starts or stops the local telemetry logger, and asks separately about starting it at logon | |
 | 10 | Uninstall | Removes the hook, settings, logger and autostart, and keeps your data unless you say otherwise | |
 | 11 | Lost startup apps | Read-only list of startup apps missing from your Run key (see the notice above) | |
+| Q | Quit | Leaves without changing anything (the default) | |
 
 Command line equivalents:
 
@@ -134,7 +176,28 @@ Command line equivalents:
 ```
 
 `-Yes` skips confirmations for runs such as `-Replicate`, but it never turns on the logger or autostart and never
-deletes data.
+deletes data. `Get-Help .\Claude-Summary-Tuner.ps1` lists the parameters; the examples are in the script's header.
+
+Exit codes: `0` done (also for `-Status`, `-WhatIf` and `-ListLostStartupApps`); `1` `-Verify` found a mismatch,
+or PowerShell rejected a parameter value (e.g. `-Mode fast`); `2` contradictory options, e.g. `-Mode off -Logger off`
+(it tells you to run `-Logger off` separately) or `-DeleteData -KeepData`.
+
+`-ListLostStartupApps` prints something like this (example):
+
+```text
+== Startup apps missing from HKCU\...\CurrentVersion\Run (read-only check, nothing is changed) ==
+  Run key now has 1 value(s): ClaudeSummaryTunerCollector
+  16 name(s) Windows remembers as startup apps but that no longer have a Run value:
+
+Name                       State
+----                       -----
+OneDrive                   was disabled
+Steam                      was disabled
+Spotify                    was disabled
+...
+```
+
+"was enabled" / "was disabled" is what Task Manager > Startup apps last recorded for that entry.
 
 ## The recommended experiment: baseline → switch → report
 
@@ -295,8 +358,9 @@ desktop app and its Code-tab processes and tell you when the app was started bef
 ```
 
 `-DeleteData` deletes only files that v1.0.2 or later recorded as created by itself, by exact path. Logger output
-(`events-*.tsv`), Replicate output, files from older versions and anything else in the folder stay. Delete the
-folder yourself if you want everything gone.
+(`events-*.tsv`), Replicate output, files from older versions and anything else in the folder stay. On an install
+that started on v1.0.0 or v1.0.1 that is usually nothing (`-Uninstall -DeleteData -WhatIf` then says
+`No valid ownership record`). Delete the folder yourself if you want everything gone.
 
 Without the script: delete the user env vars `BUN_OPTIONS` (or only our `--preload=…no-agent-summary.js` part of
 it), `CC_AGENT_SUMMARY_MODE`, `CC_AGENT_SUMMARY_MIN_DELAY_MS` and `CC_AGENT_SUMMARY_LOG`. If you used the logger,
@@ -339,7 +403,7 @@ as `bun install` fail with `Script not found "install"`, because `BUN_OPTIONS` r
 machine. We reproduced that on Windows with bun 1.4.3. With `--preload=<path>`, the form Flamerix's v3 also uses,
 `bun install` works and the hook still loads in Claude Code.
 
-**Upgrading from v1.0.0:** run the new script once with your current mode (e.g. `-Mode off`). It rewrites
+**Upgrading from v1.0.0 or v1.0.1:** run the new script once with your current mode (e.g. `-Mode off`). It rewrites
 `BUN_OPTIONS` to the `=` form, keeps your mode, and doesn't start a new measurement period. `-Status` warns while
 the old form is still set. Terminals opened before the upgrade keep the old value, so open a new one before
 running `bun`.
@@ -371,6 +435,7 @@ on Linux, reported working on macOS). This script is Windows-only. Only the unit
 | Logger capturing `agent_summary` requests by `query_source` | ✅ Matched the debug-log fork counts in the same run |
 | `--preload=` form loads the hook (CLI 2.1.312 and desktop app's 2.1.309) and `bun install` works with it (bun 1.4.3) | ✅ v1.0.1, on Windows |
 | Upgrade from v1.0.0 (rewrites the space form, keeps the mode) | ✅ v1.0.1, on Windows |
+| Upgrade from v1.0.1 to v1.0.2 in place, following this README (download, hash, `-Verify`, `-WhatIf`, `-Mode off`, logger restart) | ✅ v1.0.2, on Windows: mode, logger, port and autostart kept, Run key and user variables unchanged, `-Verify` OK |
 | Unit tests: BUN_OPTIONS merge and upgrade, version drift, path anonymising, number formatting under de-CH, periods, report, secrets hidden, no `New-Item -Force`, every change goes through the change gate | ✅ `test/unit.ps1`, v1.0.2: 64/64 on Windows PowerShell 5.1 and 7 (incl. the registry test). Run locally; no CI workflow yet |
 | Run key fix: other startup entries survive, only our value is set or removed, `-WhatIf` writes nothing, lost-startup-apps detection | ✅ `test/registry-windows.ps1` against a scratch key under `HKCU\Software\ClaudeSummaryTunerTest`, never the real Run key |
 | Safety regressions: `-DeleteData` keeps foreign files, `-WhatIf` runs nothing, `-Yes` never deletes data, `-NoLogger` never restarts the logger, logger stop matches only our own process | ✅ `test/security-regressions.ps1`, 49/49 on 5.1 and 7 |
