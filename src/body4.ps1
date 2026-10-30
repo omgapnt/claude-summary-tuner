@@ -151,6 +151,6 @@ function New-Report {
   $out = $ReportTo; if (-not $out) { $out = Join-Path $DataDir ('report-' + (Get-Date).ToString('yyyyMMdd-HHmm', $Inv) + '.html') }
   Ensure-Dir (Split-Path $out -Parent); Write-Text $out (Hide-UserPaths $sb.ToString())   # safety net for any path left
   Good "  HTML report: $out"
-  if (-not $NoOpen) { try { Invoke-Item -LiteralPath $out } catch {} }
+  if (-not $NoOpen -and -not $script:DryRun) { try { Invoke-Item -LiteralPath $out } catch {} }
   return $out
 }

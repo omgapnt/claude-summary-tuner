@@ -17,14 +17,33 @@
 
   RUN IT  (no admin needed; Windows PowerShell 5.1 or PowerShell 7)
       powershell -NoProfile -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1
+    "-ExecutionPolicy Bypass" applies to that one powershell process only. It does not change your
+    machine's or your account's execution policy, and the script never calls Set-ExecutionPolicy.
+    Look before you change anything (both change nothing):
+      ... -File .\Claude-Summary-Tuner.ps1 -WhatIf                   (everything this tool can touch + current state)
+      ... -File .\Claude-Summary-Tuner.ps1 -Mode off -WhatIf         (exactly what that command would change)
+      ... -File .\Claude-Summary-Tuner.ps1 -Verify [-ExpectedHash <sha256>]   (SHA256 of this file, files on disk = embedded copies?)
+      ... -File .\Claude-Summary-Tuner.ps1 -ListLostStartupApps      (startup apps missing from your Run key; read-only)
     Non-interactive examples:
       ... -File .\Claude-Summary-Tuner.ps1 -Mode baseline
       ... -File .\Claude-Summary-Tuner.ps1 -Mode slow            (5 minutes)
       ... -File .\Claude-Summary-Tuner.ps1 -Mode custom -Minutes 2.5
-      ... -File .\Claude-Summary-Tuner.ps1 -Mode off
+      ... -File .\Claude-Summary-Tuner.ps1 -Mode off [-Logger on [-Autostart on]] [-NoLogger]
       ... -File .\Claude-Summary-Tuner.ps1 -CheckRestart | -Status | -Report | -Replicate [-Yes]
-      ... -File .\Claude-Summary-Tuner.ps1 -Logger off | -Logger on
+      ... -File .\Claude-Summary-Tuner.ps1 -Logger on [-Autostart on] | -Logger off | -Autostart on|off
       ... -File .\Claude-Summary-Tuner.ps1 -Uninstall [-DeleteData]
+
+  SECURITY  (details, full inventory and how to verify: SECURITY.md in the repository)
+    * No admin, no downloads, no direct external requests by this script, no telemetry to the author, no Invoke-Expression,
+      no encoded or compressed code. -Replicate launches usage-bearing Claude/provider requests. Plain text: the hook ($HookJs) and the optional
+      logger ($CollectorPs) are embedded as readable here-strings right after this header.
+    * Persistent writes use the "CHANGE GATE" helpers below. Preview takes a separate read-only route before
+      any action handler: no child processes, socket probes, or writes. Behavioral regression tests cover it.
+    * The logger and its autostart are opt-in (since v1.0.2): nothing listens on a port and nothing starts at
+      logon unless you choose it. Telemetry variable values (OTEL_*, anything named like a key/token/header)
+      are never printed.
+    * v1.0.0 and v1.0.1 had a bug that removed OTHER apps' startup entries (HKCU Run key) whenever the logger was
+      turned on. Fixed in v1.0.2; -ListLostStartupApps shows which entries are missing.
 
   RISK / TERMS  (please read)
     * Unofficial. Not affiliated with, sponsored or endorsed by Anthropic. "Claude" and "Claude Code" are
@@ -65,13 +84,21 @@ param(
   [switch]$NoOpen,
   [string]$DataDir,
   [int]$Port = 0,
-  [string]$ReportTo
-
+  [string]$ReportTo,
+  # -WhatIf (alias -DryRun): print every change the chosen action would make, make none.
+  [Alias('DryRun')][switch]$WhatIf,
+  # -Verify: SHA256 of this file, and whether the hook/logger files on disk match the copies embedded here.
+  [switch]$Verify,
+  [string]$ExpectedHash,
+  # -Autostart on|off: start the logger at every logon (HKCU Run value). Off unless you turn it on.
+  [ValidateSet('on', 'off')][string]$Autostart,
+  # -ListLostStartupApps: read-only; lists startup apps Windows remembers that no longer have a Run value.
+  [switch]$ListLostStartupApps
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
 $ToolName = 'Claude-Summary-Tuner'
-$ToolVersion = '1.0.1'
+$ToolVersion = '1.0.2'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'cc-summary-tuner' }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'

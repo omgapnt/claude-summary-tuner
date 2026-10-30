@@ -17,14 +17,33 @@
 
   RUN IT  (no admin needed; Windows PowerShell 5.1 or PowerShell 7)
       powershell -NoProfile -ExecutionPolicy Bypass -File .\Claude-Summary-Tuner.ps1
+    "-ExecutionPolicy Bypass" applies to that one powershell process only. It does not change your
+    machine's or your account's execution policy, and the script never calls Set-ExecutionPolicy.
+    Look before you change anything (both change nothing):
+      ... -File .\Claude-Summary-Tuner.ps1 -WhatIf                   (everything this tool can touch + current state)
+      ... -File .\Claude-Summary-Tuner.ps1 -Mode off -WhatIf         (exactly what that command would change)
+      ... -File .\Claude-Summary-Tuner.ps1 -Verify [-ExpectedHash <sha256>]   (SHA256 of this file, files on disk = embedded copies?)
+      ... -File .\Claude-Summary-Tuner.ps1 -ListLostStartupApps      (startup apps missing from your Run key; read-only)
     Non-interactive examples:
       ... -File .\Claude-Summary-Tuner.ps1 -Mode baseline
       ... -File .\Claude-Summary-Tuner.ps1 -Mode slow            (5 minutes)
       ... -File .\Claude-Summary-Tuner.ps1 -Mode custom -Minutes 2.5
-      ... -File .\Claude-Summary-Tuner.ps1 -Mode off
+      ... -File .\Claude-Summary-Tuner.ps1 -Mode off [-Logger on [-Autostart on]] [-NoLogger]
       ... -File .\Claude-Summary-Tuner.ps1 -CheckRestart | -Status | -Report | -Replicate [-Yes]
-      ... -File .\Claude-Summary-Tuner.ps1 -Logger off | -Logger on
+      ... -File .\Claude-Summary-Tuner.ps1 -Logger on [-Autostart on] | -Logger off | -Autostart on|off
       ... -File .\Claude-Summary-Tuner.ps1 -Uninstall [-DeleteData]
+
+  SECURITY  (details, full inventory and how to verify: SECURITY.md in the repository)
+    * No admin, no downloads, no direct external requests by this script, no telemetry to the author, no Invoke-Expression,
+      no encoded or compressed code. -Replicate launches usage-bearing Claude/provider requests. Plain text: the hook ($HookJs) and the optional
+      logger ($CollectorPs) are embedded as readable here-strings right after this header.
+    * Persistent writes use the "CHANGE GATE" helpers below. Preview takes a separate read-only route before
+      any action handler: no child processes, socket probes, or writes. Behavioral regression tests cover it.
+    * The logger and its autostart are opt-in (since v1.0.2): nothing listens on a port and nothing starts at
+      logon unless you choose it. Telemetry variable values (OTEL_*, anything named like a key/token/header)
+      are never printed.
+    * v1.0.0 and v1.0.1 had a bug that removed OTHER apps' startup entries (HKCU Run key) whenever the logger was
+      turned on. Fixed in v1.0.2; -ListLostStartupApps shows which entries are missing.
 
   RISK / TERMS  (please read)
     * Unofficial. Not affiliated with, sponsored or endorsed by Anthropic. "Claude" and "Claude Code" are
@@ -65,13 +84,21 @@ param(
   [switch]$NoOpen,
   [string]$DataDir,
   [int]$Port = 0,
-  [string]$ReportTo
-
+  [string]$ReportTo,
+  # -WhatIf (alias -DryRun): print every change the chosen action would make, make none.
+  [Alias('DryRun')][switch]$WhatIf,
+  # -Verify: SHA256 of this file, and whether the hook/logger files on disk match the copies embedded here.
+  [switch]$Verify,
+  [string]$ExpectedHash,
+  # -Autostart on|off: start the logger at every logon (HKCU Run value). Off unless you turn it on.
+  [ValidateSet('on', 'off')][string]$Autostart,
+  # -ListLostStartupApps: read-only; lists startup apps Windows remembers that no longer have a Run value.
+  [switch]$ListLostStartupApps
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Off
 $ToolName = 'Claude-Summary-Tuner'
-$ToolVersion = '1.0.1'
+$ToolVersion = '1.0.2'
 if (-not $DataDir) { $DataDir = Join-Path $env:LOCALAPPDATA 'cc-summary-tuner' }
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $RunKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -206,6 +233,11 @@ $mutex = New-Object System.Threading.Mutex($true, "Local\ClaudeSummaryTunerColle
 if (-not $created) { Write-CLog "another collector already owns port $Port, exiting"; exit 0 }
 [IO.File]::WriteAllText((Join-Path $DataDir 'collector.pid'), "$PID", $utf8)
 $script:received = 0; $script:stored = 0; $started = (Get-Date).ToUniversalTime().ToString('o')
+$MaxBody = 8MB        # v1.0.2: larger request bodies are refused (413)
+$MaxInflated = 32MB   # and gzip bodies may not expand beyond this
+$MaxDaily = 128MB     # fail closed on event storage growth; never delete files by wildcard
+$MaxTotal = 512MB
+$MaxRequestMs = 10000
 $Cols = 't', 'event', 'session', 'model', 'query_source', 'cost_usd', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens', 'duration_ms', 'version', 'agent', 'tag', 'status'
 
 function Get-AnyValue($v) {
@@ -225,7 +257,10 @@ function ConvertTo-Field([object]$x) { if ($null -eq $x) { return '' }; return (
 function Save-Logs([byte[]]$bytes, [string]$encoding) {
   if ($encoding -match 'gzip') {
     $ms = New-Object IO.MemoryStream(, $bytes); $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Decompress)
-    $out = New-Object IO.MemoryStream; $gz.CopyTo($out); $bytes = $out.ToArray(); $gz.Dispose()
+    $out = New-Object IO.MemoryStream; $buf = New-Object byte[] 65536
+    try { while (($n = $gz.Read($buf, 0, $buf.Length)) -gt 0) { $out.Write($buf, 0, $n); if ($out.Length -gt $MaxInflated) { throw 'gzip body too large after decompression, dropped' } } }
+    finally { $gz.Dispose() }
+    $bytes = $out.ToArray()
   }
   $json = $utf8.GetString($bytes)
   if (-not $json.Trim()) { return }
@@ -257,8 +292,12 @@ function Save-Logs([byte[]]$bytes, [string]$encoding) {
   if ($lines.Count -gt 0) {
     $file = Join-Path $DataDir ('events-' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd') + '.tsv')
     $text = ''
-    if (-not (Test-Path $file)) { $text = ($Cols -join "`t") + "`r`n" }
+    if (-not (Test-Path $file) -or (Get-Item -LiteralPath $file).Length -eq 0) { $text = ($Cols -join "`t") + "`r`n" }
     $text += ($lines -join "`r`n") + "`r`n"
+    $incoming = $utf8.GetByteCount($text)
+    $daily = 0; if (Test-Path -LiteralPath $file) { $daily = (Get-Item -LiteralPath $file).Length }
+    $total = [long](@(Get-ChildItem -LiteralPath $DataDir -Filter 'events-*.tsv' -File | Measure-Object Length -Sum)[0].Sum)
+    if ($daily + $incoming -gt $MaxDaily -or $total + $incoming -gt $MaxTotal) { throw 'event storage quota reached' }
     [IO.File]::AppendAllText($file, $text, $utf8)
     $script:stored += $lines.Count
   }
@@ -268,63 +307,126 @@ function Get-Health { return ('{"ok":true,"app":"claude-summary-tuner","pid":' +
 function Invoke-Route([string]$method, [string]$path, [byte[]]$body, [string]$enc) {
   if ($method -eq 'GET' -and $path -eq '/health') { return @(200, (Get-Health)) }
   if ($method -eq 'POST' -and $path -like '/v1/logs*') {
-    try { Save-Logs $body $enc } catch { Write-CLog "parse error: $($_.Exception.Message)" }
+    try { Save-Logs $body $enc } catch { Write-CLog 'invalid or oversized telemetry, dropped'; return @(400, '{}') }
     return @(200, '{}')
   }
   if ($method -eq 'POST' -and $path -like '/v1/*') { return @(200, '{}') }  # metrics/traces: accepted and dropped
   return @(404, '{}')
 }
 
-$listener = $null; $tcp = $null
-for ($try = 0; $try -lt 30 -and -not $listener -and -not $tcp; $try++) {
+function Read-RequestBytes($stream, [byte[]]$buffer, [int]$offset, [int]$count, $clock) {
+  $remaining = $MaxRequestMs - [int]$clock.ElapsedMilliseconds
+  if ($remaining -le 0) { throw 'request deadline exceeded' }
+  $stream.ReadTimeout = $remaining
+  return $stream.Read($buffer, $offset, $count)
+}
+function Read-HeaderLine($stream, $clock, [int]$limit = 8192) {
+  $line = New-Object IO.MemoryStream; $one = New-Object byte[] 1
   try {
-    $l = New-Object Net.HttpListener; $l.Prefixes.Add("http://127.0.0.1:$Port/"); $l.Start(); $listener = $l
-    Write-CLog "listening (HttpListener) on http://127.0.0.1:$Port/"
-  } catch {
-    $msg = $_.Exception.Message
-    try {
-      $t = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port); $t.Start(); $tcp = $t
-      Write-CLog "HttpListener failed ($msg); listening (TcpListener) on 127.0.0.1:$Port"
-    } catch {
-      Write-CLog "port $Port unavailable ($msg / $($_.Exception.Message)); retry in 20 s"
-      Start-Sleep -Seconds 20
+    while ($line.Length -lt $limit) {
+      if ((Read-RequestBytes $stream $one 0 1 $clock) -eq 0) { throw 'incomplete line' }
+      $line.WriteByte($one[0])
+      if ($one[0] -eq 10) {
+        $bytes = $line.ToArray()
+        if ($bytes.Length -lt 2 -or $bytes[$bytes.Length - 2] -ne 13) { throw 'bad line ending' }
+        return [Text.Encoding]::ASCII.GetString($bytes, 0, $bytes.Length - 2)
+      }
     }
+    throw 'line too long'
+  } finally { $line.Dispose() }
+}
+function Read-ChunkedBody($stream, $clock) {
+  $body = New-Object IO.MemoryStream; $buf = New-Object byte[] 65536
+  try {
+    while ($true) {
+      $line = Read-HeaderLine $stream $clock
+      $sizeText = ($line -split ';', 2)[0]; $size = [long]0
+      if ($sizeText -notmatch '^[0-9A-Fa-f]{1,8}$' -or -not [long]::TryParse($sizeText, [Globalization.NumberStyles]::HexNumber, [Globalization.CultureInfo]::InvariantCulture, [ref]$size)) { throw 'invalid chunk length' }
+      if ($body.Length + $size -gt $MaxBody) { throw 'chunked body too large' }
+      if ($size -eq 0) {
+        $trailerBytes = 0
+        do { $trailer = Read-HeaderLine $stream $clock; $trailerBytes += $trailer.Length + 2; if ($trailerBytes -gt 65536) { throw 'trailers too large' } } while ($trailer)
+        return ,$body.ToArray()
+      }
+      $left = $size
+      while ($left -gt 0) {
+        $n = Read-RequestBytes $stream $buf 0 ([int][Math]::Min($buf.Length, $left)) $clock
+        if ($n -eq 0) { throw 'incomplete chunk' }; $body.Write($buf, 0, $n); $left -= $n
+      }
+      if ((Read-HeaderLine $stream $clock 2) -ne '') { throw 'missing chunk separator' }
+    }
+  } finally { $body.Dispose() }
+}
+$tcp = $null
+for ($attempt = 0; $attempt -lt 30 -and -not $tcp; $attempt++) {
+  $candidate = $null
+  try {
+    $candidate = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $Port)
+    $candidate.Start(); $tcp = $candidate
+    Write-CLog "listening on 127.0.0.1:$Port"
+  } catch {
+    if ($candidate) { $candidate.Stop() }
+    Write-CLog 'loopback port unavailable; retrying in 20 seconds'
+    Start-Sleep -Seconds 20
   }
 }
-if (-not $listener -and -not $tcp) { Write-CLog 'giving up: could not bind'; exit 1 }
-
-while ($true) {
-  try {
-    if ($listener) {
-      $ctx = $listener.GetContext(); $req = $ctx.Request
-      $ms = New-Object IO.MemoryStream; $req.InputStream.CopyTo($ms)
-      $res = Invoke-Route $req.HttpMethod $req.Url.AbsolutePath $ms.ToArray() ([string]$req.Headers['Content-Encoding'])
+if (-not $tcp) { Write-CLog 'giving up: could not bind loopback port'; exit 1 }
+try {
+  while ($true) {
+    $client = $null; $ns = $null; $acc = $null
+    try {
+      $client = $tcp.AcceptTcpClient(); $ns = $client.GetStream(); $ns.WriteTimeout = 2000
+      $clock = [Diagnostics.Stopwatch]::StartNew()
+      $acc = New-Object IO.MemoryStream; $one = New-Object byte[] 1; $tail = ''
+      # Read only the header, up to 64 KiB, without consuming any unframed body bytes.
+      while ($tail -ne "`r`n`r`n") {
+        if ($acc.Length -ge 65536) { throw 'header too large' }
+        $n = Read-RequestBytes $ns $one 0 1 $clock
+        if ($n -eq 0) { throw 'incomplete header' }
+        $acc.WriteByte($one[0]); $tail += [char]$one[0]
+        if ($tail.Length -gt 4) { $tail = $tail.Substring($tail.Length - 4) }
+      }
+      $head = [Text.Encoding]::ASCII.GetString($acc.ToArray())
+      $hl = $head -split "`r`n"; $parts = $hl[0] -split ' '
+      if ($parts.Count -ne 3 -or $parts[2] -notmatch '^HTTP/1\.[01]$') { throw 'bad request line' }
+      $len = [long]0; $seenLength = $false; $enc = ''; $expect = $false; $chunked = $false
+      foreach ($h in $hl | Select-Object -Skip 1) {
+        if ($h -match '^(?i)transfer-encoding:\s*(.*?)\s*$') {
+          if ($chunked -or $matches[1] -ne 'chunked') { throw 'unsupported transfer encoding' }; $chunked = $true
+        }
+        if ($h -match '^(?i)content-length:\s*(.*?)\s*$') {
+          $lengthText = $matches[1]
+          if ($seenLength -or $lengthText -notmatch '^\d+$' -or -not [long]::TryParse($lengthText, [ref]$len)) { throw 'bad content length' }
+          $seenLength = $true
+        }
+        if ($h -match '^(?i)content-encoding:\s*(.+)$') { $enc = $matches[1].Trim() }
+        if ($h -match '^(?i)expect:\s*100-continue\s*$') { $expect = $true }
+      }
+      if ($chunked -and $seenLength) { throw 'ambiguous body framing' }
+      if ($parts[0] -eq 'POST' -and -not ($seenLength -or $chunked)) { $res = @(411, '{}') }
+      elseif ($len -gt $MaxBody) { Write-CLog 'request over body cap, refused'; $res = @(413, '{}') }
+      else {
+        if ($expect) { $interim = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n"); $ns.Write($interim, 0, $interim.Length) }
+        if ($chunked) { $body = Read-ChunkedBody $ns $clock }
+        else {
+          $body = New-Object byte[] ([int]$len); $read = 0
+          while ($read -lt $len) {
+            $n = Read-RequestBytes $ns $body $read ([Math]::Min(65536, [int]$len - $read)) $clock
+            if ($n -eq 0) { throw 'incomplete body' }; $read += $n
+          }
+        }
+        if ($enc -and $enc -ne 'gzip' -and $enc -ne 'identity') { $res = @(415, '{}') }
+        else { $res = Invoke-Route $parts[0] (($parts[1] -split '\?')[0]) $body $enc }
+      }
       $out = $utf8.GetBytes([string]$res[1])
-      $ctx.Response.StatusCode = [int]$res[0]; $ctx.Response.ContentType = 'application/json'
-      $ctx.Response.ContentLength64 = $out.Length; $ctx.Response.OutputStream.Write($out, 0, $out.Length); $ctx.Response.Close()
-    } else {
-      $client = $tcp.AcceptTcpClient(); $client.ReceiveTimeout = 10000; $ns = $client.GetStream()
-      $buf = New-Object byte[] 65536; $acc = New-Object IO.MemoryStream; $hdrEnd = -1
-      while ($hdrEnd -lt 0) {
-        $n = $ns.Read($buf, 0, $buf.Length); if ($n -le 0) { break }
-        $acc.Write($buf, 0, $n); $s = [Text.Encoding]::ASCII.GetString($acc.ToArray()); $hdrEnd = $s.IndexOf("`r`n`r`n")
-      }
-      if ($hdrEnd -ge 0) {
-        $all = $acc.ToArray(); $head = [Text.Encoding]::ASCII.GetString($all, 0, $hdrEnd); $hl = $head -split "`r`n"
-        $parts = $hl[0] -split ' '; $len = 0; $enc = ''
-        foreach ($h in $hl) { if ($h -match '^(?i)content-length:\s*(\d+)') { $len = [int]$matches[1] }; if ($h -match '^(?i)content-encoding:\s*(.+)$') { $enc = $matches[1] }; if ($h -match '^(?i)expect:\s*100-continue') { $c = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n"); $ns.Write($c, 0, $c.Length) } }
-        $body = New-Object IO.MemoryStream; $start = $hdrEnd + 4
-        if ($all.Length -gt $start) { $body.Write($all, $start, $all.Length - $start) }
-        while ($body.Length -lt $len) { $n = $ns.Read($buf, 0, $buf.Length); if ($n -le 0) { break }; $body.Write($buf, 0, $n) }
-        $res = Invoke-Route $parts[0] (($parts[1] -split '\?')[0]) $body.ToArray() $enc
-        $out = $utf8.GetBytes([string]$res[1])
-        $hdr = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $($res[0]) OK`r`nContent-Type: application/json`r`nContent-Length: $($out.Length)`r`nConnection: close`r`n`r`n")
-        $ns.Write($hdr, 0, $hdr.Length); $ns.Write($out, 0, $out.Length)
-      }
-      $client.Close()
+      $hdr = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $($res[0]) Result`r`nContent-Type: application/json`r`nContent-Length: $($out.Length)`r`nConnection: close`r`n`r`n")
+      $ns.Write($hdr, 0, $hdr.Length); $ns.Write($out, 0, $out.Length)
+    } catch { Write-CLog 'invalid, incomplete, or timed-out request, dropped' }
+    finally {
+      if ($acc) { $acc.Dispose() }; if ($ns) { $ns.Dispose() }; if ($client) { $client.Close() }
     }
-  } catch { Write-CLog "request error: $($_.Exception.Message)"; Start-Sleep -Milliseconds 200 }
-}
+  }
+} finally { $tcp.Stop(); $mutex.Dispose() }
 '@
 
 # ------------------------------------------------------------------ helpers
@@ -357,15 +459,191 @@ function Ask([string]$q, [string]$def = '') {
   return $a.Trim()
 }
 function AskYesNo([string]$q, [bool]$def = $false) {
-  if ($Yes) { return $true }
   $d = 'y/N'; if ($def) { $d = 'Y/n' }
   $a = Read-Host "$q [$d]"
   if (-not $a) { return $def }
   return ($a.Trim().ToLower() -in 'y', 'yes', 'j', 'ja')
 }
-function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null } }
-function Write-Text([string]$p, [string]$t) { [IO.File]::WriteAllText($p, $t, $Utf8NoBom) }
-function Append-Text([string]$p, [string]$t) { [IO.File]::AppendAllText($p, $t, $Utf8NoBom) }
+
+# ================================================================== CHANGE GATE
+# EVERY persistent change this script can make goes through the functions in this section and nowhere else
+# (test/unit.ps1 parses the script and fails if any other function writes files, environment variables or the
+# registry, or starts/stops processes). That makes the whole "what can it change" review this one section:
+#   files      : Ensure-Dir, Write-Text, Append-Text, Remove-OwnFile, Remove-OwnData  (the data folder, see SECURITY.md)
+#   user env   : Set-UserEnv          (only BUN_OPTIONS, CC_AGENT_SUMMARY_*, and the 4 logger OTEL variables)
+#   registry   : Set-RunValue, Remove-RunValue  (only HKCU\...\Run\ClaudeSummaryTunerCollector, opt-in autostart)
+#   processes  : Start-CollectorProcess, Stop-CollectorProcess, Stop-ClaudeDaemon, Start-ReplicateChild
+# With -WhatIf / -DryRun each of them prints "WOULD ..." and does nothing.
+$script:DryRun = [bool]$WhatIf
+$script:Planned = New-Object System.Collections.Generic.List[string]
+function Write-Plan([string]$what) { $script:Planned.Add($what); Write-Host "  WOULD $what" -ForegroundColor Magenta }
+function Test-SecretName([string]$n) {
+  # Values of these variables are never printed (OTEL headers often hold an API key).
+  return [bool]($n -match '(?i)^OTEL_|HEADER|KEY|TOKEN|SECRET|PASSW|AUTH|CREDENTIAL|COOKIE')
+}
+function Show-EnvValue([string]$n, [string]$v) {
+  if ($null -eq $v -or $v -eq '') { return '(not set)' }
+  if (Test-SecretName $n) { return '(set, value not shown)' }
+  return "'$v'"
+}
+function Test-InsideDataDir([string]$p) {
+  if (-not $p) { return $false }
+  try { $full = [IO.Path]::GetFullPath($p); $root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/') } catch { return $false }
+  return $full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)
+}
+function Ensure-Dir([string]$p) {
+  # File system folders only (never a registry path).
+  if (Test-Path -LiteralPath $p) { return }
+  if ($script:DryRun) { Write-Plan "create folder $p"; return }
+  [void][IO.Directory]::CreateDirectory($p)
+}
+function Write-Text([string]$p, [string]$t) {
+  if ($script:DryRun) { Write-Plan "$(if (Test-Path -LiteralPath $p) { 'overwrite' } else { 'create' }) file $p ($($Utf8NoBom.GetByteCount($t)) bytes)"; return }
+  $created = -not (Test-Path -LiteralPath $p)
+  [IO.File]::WriteAllText($p, $t, $Utf8NoBom)
+  if ($created) { Register-OwnFile $p }
+}
+function Append-Text([string]$p, [string]$t) {
+  if ($script:DryRun) { Write-Plan "append $($Utf8NoBom.GetByteCount($t)) bytes to $p"; return }
+  $created = -not (Test-Path -LiteralPath $p)
+  [IO.File]::AppendAllText($p, $t, $Utf8NoBom)
+  if ($created) { Register-OwnFile $p }
+}
+# Ownership is recorded only when this process creates a new file. Existing files are never
+# adopted by filename. Old installations without this manifest are preserved by -DeleteData.
+function Test-SafeDataPath([string]$p) {
+  try {
+    $root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/')
+    $full = [IO.Path]::GetFullPath($p)
+    if ($root -notmatch '^[A-Za-z]:\\' -or $root.Length -le 3) { return $false }
+    foreach ($protected in @($env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, $env:ProgramData)) {
+      if ($protected -and $root -eq [IO.Path]::GetFullPath($protected).TrimEnd('\', '/')) { return $false }
+    }
+    if ($full -ne $root -and -not (Test-InsideDataDir $full)) { return $false }
+    $itemPath = $full
+    while ($itemPath) {
+      if (Test-Path -LiteralPath $itemPath) {
+        if ((Get-Item -LiteralPath $itemPath -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+      }
+      $parent = Split-Path $itemPath -Parent
+      if ($parent -eq $itemPath) { break }; $itemPath = $parent
+    }
+    return $true
+  } catch { return $false }
+}
+function Get-OwnershipPath { return (Join-Path $DataDir '.cst-owned-files.json') }
+function Get-Ownership {
+  $path = Get-OwnershipPath
+  if (-not (Test-SafeDataPath $path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+  try {
+    $m = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $id = [guid]::Empty
+    if ($m.tool -cne 'Claude-Summary-Tuner' -or $m.schema -ne 1 -or
+        -not [guid]::TryParse([string]$m.installId, [ref]$id) -or
+        [string]$m.root -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/')) { return $null }
+    foreach ($relative in @($m.files)) {
+      if (-not $relative -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)' -or
+          -not (Test-SafeDataPath (Join-Path $DataDir $relative))) { return $null }
+    }
+    return $m
+  } catch { return $null }
+}
+function Register-OwnFile([string]$p) {
+  if ($script:DryRun -or -not (Test-InsideDataDir $p) -or -not (Test-SafeDataPath $p)) { return }
+  $path = Get-OwnershipPath; $m = Get-Ownership
+  if (-not $m) {
+    # Never replace an invalid/pre-existing marker or claim a legacy installation's files.
+    if (Test-Path -LiteralPath $path) { return }
+    $m = [pscustomobject]@{ tool = 'Claude-Summary-Tuner'; schema = 1; installId = [guid]::NewGuid().ToString(); root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/'); files = @() }
+  }
+  $relative = [IO.Path]::GetFullPath($p).Substring($m.root.Length + 1)
+  if ($relative -eq '.cst-owned-files.json') { return }
+  $m.files = @(@($m.files) + $relative | Select-Object -Unique)
+  [IO.File]::WriteAllText($path, ($m | ConvertTo-Json -Depth 4), $Utf8NoBom)
+}
+function Test-OwnedFile([string]$p) {
+  if (-not (Test-SafeDataPath $p)) { return $false }
+  $m = Get-Ownership; if (-not $m) { return $false }
+  return [bool](@($m.files) | Where-Object { [IO.Path]::GetFullPath((Join-Path $DataDir $_)) -eq [IO.Path]::GetFullPath($p) })
+}
+function Remove-OwnFile([string]$p, [string]$allowed) {
+  # $allowed is retained for compatibility; it can never authorize an outside/untracked file.
+  if (-not $p -or -not (Test-Path -LiteralPath $p -PathType Leaf)) { return }
+  if (-not (Test-OwnedFile $p)) { Warn "not deleting $p (not recorded as a file created by this installation)"; return }
+  if ($script:DryRun) { Write-Plan "delete $p"; return }
+  # Forget first: if deletion or the process fails, preserve the leftover file as untracked.
+  # This also prevents a subsequent uninstall claiming a new foreign file at the old path.
+  $m = Get-Ownership
+  $m.files = @($m.files | Where-Object { [IO.Path]::GetFullPath((Join-Path $DataDir $_)) -ne [IO.Path]::GetFullPath($p) })
+  [IO.File]::WriteAllText((Get-OwnershipPath), ($m | ConvertTo-Json -Depth 4), $Utf8NoBom)
+  Remove-Item -LiteralPath $p -Force -ErrorAction Stop
+}
+function Remove-OwnData([string]$keep, $ownership) {
+  # Use the snapshot taken BEFORE uninstall performs any writes. No glob or recursive deletion.
+  if (-not $ownership) { Warn 'No pre-existing ownership record; legacy/untracked data was preserved.'; return $false }
+  $current = Get-Ownership
+  if (-not $current -or $current.installId -ne $ownership.installId) { Warn 'Ownership changed; data was preserved.'; return $false }
+  foreach ($relative in @($ownership.files)) {
+    $p = Join-Path $DataDir $relative
+    if ($keep -and [IO.Path]::GetFullPath($p) -eq [IO.Path]::GetFullPath($keep)) { continue }
+    Remove-OwnFile $p
+  }
+  # Keep the manifest and directories. Unknown files (including future collector logs) stay untouched.
+  return $true
+}
+function Set-UserEnv([string]$n, [string]$v) {
+  # Per-user environment variable (HKCU\Environment), no admin. Only called for the names listed in SECURITY.md.
+  if ($script:DryRun) {
+    $cur = [Environment]::GetEnvironmentVariable($n, 'User')
+    if ([string]$cur -eq [string]$v) { return }
+    if ([string]::IsNullOrEmpty($v)) { Write-Plan "remove user variable $n (now $(Show-EnvValue $n $cur))" } else { Write-Plan "set user variable $n = $(Show-EnvValue $n $v) (now $(Show-EnvValue $n $cur))" }
+    return
+  }
+  if ([string]::IsNullOrEmpty($v)) { [Environment]::SetEnvironmentVariable($n, $null, 'User') }
+  else { [Environment]::SetEnvironmentVariable($n, $v, 'User') }
+}
+function Set-RunValue([string]$cmd) {
+  # The ONLY registry write: the opt-in logger autostart. Visible in Task Manager > Startup apps; -Autostart off removes it.
+  # v1.0.2 fix: v1.0.0/1.0.1 called "New-Item <Run key> -Force" here, which deletes and recreates the whole Run key
+  # and so removed every other app's startup entry. The key is now only created when it does not exist, never -Force.
+  if ($script:DryRun) { Write-Plan "set registry value $RunKeyPath\$RunValueName = $cmd"; return }
+  if (-not (Test-Path -LiteralPath $RunKeyPath)) { New-Item -Path $RunKeyPath | Out-Null }
+  Set-ItemProperty -LiteralPath $RunKeyPath -Name $RunValueName -Value $cmd
+}
+function Remove-RunValue {
+  if (-not (Get-ItemProperty -LiteralPath $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue)) { return }
+  if ($script:DryRun) { Write-Plan "delete registry value $RunKeyPath\$RunValueName"; return }
+  Remove-ItemProperty -LiteralPath $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue
+}
+function Start-CollectorProcess($c) {
+  # Starts the local logger (powershell.exe running the collector.ps1 this script wrote) without a console window,
+  # because it is a background listener. It shows in Task Manager as powershell.exe with collector.ps1 in its
+  # command line; -Logger off stops it.
+  if ($script:DryRun) { Write-Plan "start the logger: $($c.full)"; return }
+  Start-Process -FilePath $c.file -ArgumentList $c.args -WindowStyle Hidden | Out-Null
+}
+function Stop-CollectorProcess([int]$cp) {
+  # Require this installation's exact -File path, not a collector.ps1 substring.
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cp" -ErrorAction SilentlyContinue
+  $collectorPath = [IO.Path]::GetFullPath((Join-Path $DataDir 'collector.ps1'))
+  $fileArgument = '(?i)(?:^|\s)-File\s+"?' + [regex]::Escape($collectorPath) + '(?:"|\s|$)'
+  if (-not ($p -and $p.Name -eq 'powershell.exe' -and [string]$p.CommandLine -match $fileArgument)) { return $false }
+  if ($script:DryRun) { Write-Plan "stop the logger process (PID $cp)"; return $false }
+  Stop-Process -Id $cp -Force -ErrorAction SilentlyContinue; return $true
+}
+function Stop-ClaudeDaemon([string]$exe) {
+  # Only after you confirm in the restart check: runs Claude Code's own "claude daemon stop --any".
+  if ($script:DryRun) { Write-Plan "run: $exe daemon stop --any"; return '' }
+  return (Invoke-Isolated $exe @('daemon', 'stop', '--any') @{}).out
+}
+function Start-ReplicateChild([string]$exe, [string]$argStr, [string]$dir, [string]$inF, [string]$outF, [string]$errF) {
+  # -Replicate only: one "claude -p --model haiku" test run; stopped after 15 minutes if it hangs.
+  if ($script:DryRun) { Write-Plan "run: $exe $argStr"; return $true }
+  $p = Start-Process -FilePath $exe -ArgumentList $argStr -WorkingDirectory $dir -RedirectStandardInput $inF -RedirectStandardOutput $outF -RedirectStandardError $errF -NoNewWindow -PassThru
+  if (-not $p.WaitForExit(900000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; return $false }
+  return $true
+}
+# ================================================================== end of CHANGE GATE
 
 # ------------------------------------------------------------------ config + journal
 $ConfigPath = Join-Path $DataDir 'config.json'
@@ -375,7 +653,7 @@ function Get-Config {
   $c = $null
   if (Test-Path -LiteralPath $ConfigPath) { try { $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } catch { $c = $null } }
   if (-not $c) { $c = New-Object PSObject }
-  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache', 'ccVersions', 'desktopCcVersions', 'toolVersion') {
+  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache', 'ccVersions', 'desktopCcVersions', 'toolVersion', 'loggerAutostart') {
     if (-not $c.PSObject.Properties[$k]) { $c | Add-Member -NotePropertyName $k -NotePropertyValue $null }
   }
   return $c
@@ -398,10 +676,6 @@ function Read-Journal {
 
 # ------------------------------------------------------------------ user environment
 function Get-UserEnv([string]$n) { return [Environment]::GetEnvironmentVariable($n, 'User') }
-function Set-UserEnv([string]$n, [string]$v) {
-  if ([string]::IsNullOrEmpty($v)) { [Environment]::SetEnvironmentVariable($n, $null, 'User') }
-  else { [Environment]::SetEnvironmentVariable($n, $v, 'User') }
-}
 
 # BUN_OPTIONS is split on whitespace by Bun; quotes are NOT honoured (a quoted path silently fails to load)
 # and backslashes are eaten. So: forward slashes, no spaces, and keep every other option as it was.
@@ -441,6 +715,7 @@ function ConvertTo-BunPath([string]$p) {
   $f = $p -replace '\\', '/'
   if ($f -notmatch '\s') { return $f }
   try {
+    # Windows' own FileSystemObject is used only to read the 8.3 short name of a path that contains spaces.
     $fso = New-Object -ComObject Scripting.FileSystemObject
     $sp = $fso.GetFile($p).ShortPath
     if ($sp -and $sp -notmatch '\s') { return ($sp -replace '\\', '/') }
@@ -487,7 +762,9 @@ function Hide-UserPaths([string]$s) {
   return $s
 }
 function Invoke-Isolated([string]$exe, [string[]]$argv, [hashtable]$envOverride) {
-  # Runs a child with extra/removed variables in THIS process only; nothing persistent is touched.
+  if ($script:DryRun) { Write-Plan 'check Claude version/hook after approval (not executed in preview)'; return @{ out = ''; code = 0 } }
+  # Runs a child (claude.exe) with extra/removed variables set for THIS process only ('Process' scope, gone when
+  # the script exits); nothing persistent is touched. Used for 'claude --version' and the hook self-test.
   $saved = @{}
   foreach ($k in $envOverride.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process'); [Environment]::SetEnvironmentVariable($k, $envOverride[$k], 'Process') }
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -503,9 +780,11 @@ function Get-CCVersion([string]$exe) {
   return $null
 }
 function Test-HookLoads([string]$exe, [string]$bunOptions) {
+  if ($script:DryRun) { Write-Plan 'test hook loading after approval (not executed in preview)'; return @{ ok = $true; line = 'not executed (preview)'; out = '' } }
   $tmp = Join-Path $env:TEMP ("cst-selftest-" + [guid]::NewGuid().ToString('N') + '.log')
   $r = Invoke-Isolated $exe @('--version') @{ BUN_OPTIONS = $bunOptions; CC_AGENT_SUMMARY_MODE = 'pass'; CC_AGENT_SUMMARY_LOG = $tmp; CC_AGENT_SUMMARY_MIN_DELAY_MS = $null }
   $line = $null
+  # The hook itself writes this temp log (in %TEMP%) during the self-test; it is read and deleted right here.
   if (Test-Path -LiteralPath $tmp) { $line = (Get-Content -LiteralPath $tmp | Where-Object { $_ -match 'preload active' } | Select-Object -First 1); Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
   return @{ ok = [bool]$line; line = $line; out = $r.out.Trim() }
 }
@@ -531,18 +810,17 @@ function Find-BinaryAnchors([string]$path) {
 
 # ------------------------------------------------------------------ hook file
 function Install-HookFile($cfg) {
-  # Prefer the data folder. If its Bun-safe form is impossible (spaces and no 8.3 names), use ProgramData\<SID>.
-  $cands = @((Join-Path $DataDir $HookFileName))
-  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  if ($env:ProgramData) { $cands += (Join-Path (Join-Path (Join-Path $env:ProgramData 'cc-summary-tuner') $sid) $HookFileName) }
-  foreach ($p in $cands) {
-    try {
-      Ensure-Dir (Split-Path $p -Parent); Write-Text $p $HookJs
-      $bp = ConvertTo-BunPath $p
-      if ($bp -and $bp -match '^[A-Za-z]:/[^\s"'']+$') { $cfg.hookPath = $p; $cfg.hookBunPath = $bp; return $true }
-      Warn "Path '$p' contains spaces and has no short (8.3) name; trying another location."
-    } catch { Warn "Could not write $p : $($_.Exception.Message)" }
-  }
+  # The hook lives in the data folder (%LOCALAPPDATA%\cc-summary-tuner by default). Bun cannot load a preload path
+  # with spaces, so a path with spaces falls back to its 8.3 short name. v1.0.2 removed the old shared fallback
+  # (%ProgramData%\cc-summary-tuner\<SID>): another local user could pre-create that folder and plant code there.
+  $p = Join-Path $DataDir $HookFileName
+  try {
+    Ensure-Dir $DataDir; Write-Text $p $HookJs
+    if ($script:DryRun -and -not (Test-Path -LiteralPath $p)) { $bp = $p -replace '\\', '/' } else { $bp = ConvertTo-BunPath $p }
+    if ($bp -and $bp -match '^[A-Za-z]:/[^\s"'']+$') { $cfg.hookPath = $p; $cfg.hookBunPath = $bp; return $true }
+    Warn "The data folder path '$DataDir' contains spaces and has no short (8.3) name, so Bun cannot load the hook from it."
+    Warn 'Run the script again with -DataDir pointing to a folder without spaces that only your account can write to (for example inside your own profile).'
+  } catch { Warn "Could not write $p : $($_.Exception.Message)" }
   return $false
 }
 
@@ -616,7 +894,7 @@ function Get-OtelConflicts($cfg) {
     foreach ($k in $vars.Keys) {
       if ($k -match '^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|BETA_TRACING_ENDPOINT$)') {
         if ($scope -eq 'User' -and $ours.ContainsKey($k) -and $ours[$k] -eq [string]$vars[$k]) { continue }
-        $found += "$scope environment: $k=$($vars[$k])"
+        $found += "$scope environment: $k (value not shown)"
       }
     }
   }
@@ -625,7 +903,7 @@ function Get-OtelConflicts($cfg) {
     if ($f -and (Test-Path -LiteralPath $f)) {
       try {
         $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
-        if ($j.env) { foreach ($p in $j.env.PSObject.Properties) { if ($p.Name -match '^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$)') { $found += "$f : env.$($p.Name)=$($p.Value)" } } }
+        if ($j.env) { foreach ($p in $j.env.PSObject.Properties) { if ($p.Name -match '^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$)') { $found += "$f : env.$($p.Name) (value not shown)" } } }
         if ($j.otelHeadersHelper) { $found += "$f : otelHeadersHelper is set" }
       } catch { if ($f -ne $settings) { $found += "$f exists (could not parse)" } }
     }
@@ -636,17 +914,28 @@ function Get-OtelConflicts($cfg) {
 
 # ------------------------------------------------------------------ collector
 function Test-PortFree([int]$p) {
-  try { $l = New-Object Net.HttpListener; $l.Prefixes.Add("http://127.0.0.1:$p/"); $l.Start(); $l.Stop(); $l.Close() } catch { return $false }
+  if ($script:DryRun) { return $true }
+  # Binds 127.0.0.1:<port> for a moment to see whether it is free, then releases it. Loopback only.
   try { $t = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $p); $t.Start(); $t.Stop() } catch { return $false }
   return $true
 }
 function Find-FreePort([int]$start) { for ($p = $start; $p -lt $start + 50; $p++) { if (Test-PortFree $p) { return $p } }; return 0 }
 function Get-CollectorHealth([int]$p) {
+  if ($script:DryRun) { return $null }
   if (-not $p) { return $null }
-  try { $wc = New-Object Net.WebClient; $wc.Proxy = $null; $j = $wc.DownloadString("http://127.0.0.1:$p/health"); $wc.Dispose(); $o = $j | ConvertFrom-Json; if ($o.app -eq 'claude-summary-tuner') { return $o } } catch {}
+  # Asks OUR logger on 127.0.0.1 (this PC) for its status. This is the only HTTP request the script makes, and
+  # it never leaves the machine (proxy disabled so it cannot be routed anywhere else).
+  try {
+    $rq = [Net.HttpWebRequest]::Create("http://127.0.0.1:$p/health"); $rq.Proxy = $null; $rq.Timeout = 2000
+    $rs = $rq.GetResponse(); $sr = New-Object IO.StreamReader($rs.GetResponseStream()); $j = $sr.ReadToEnd(); $sr.Dispose(); $rs.Close()
+    $o = $j | ConvertFrom-Json; if ($o.app -eq 'claude-summary-tuner') { return $o }
+  } catch { Write-Verbose "no logger on port $p" }
   return $null
 }
 function Get-CollectorCommand([int]$p) {
+  # The exact command line used to start the logger (and, only if you enable autostart, stored in the Run value).
+  # -ExecutionPolicy Bypass applies to this one process only; -WindowStyle Hidden / conhost --headless keep a
+  # background listener from leaving a console window open. Nothing else is started.
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $script = Join-Path $DataDir 'collector.ps1'
   $psArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -DataDir `"$DataDir`" -Port $p"
@@ -657,12 +946,19 @@ function Get-CollectorCommand([int]$p) {
   }
   return @{ file = $ps; args = $psArgs; full = "`"$ps`" $psArgs" }
 }
+function Test-RunValue { return [bool](Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue) }
+function Get-AutostartWanted($cfg) {
+  # v1.0.2: autostart is opt-in. Installs from v1.0.0/1.0.1 that already have the Run value keep it (it is never
+  # removed behind your back); -Autostart off removes it.
+  if ($null -ne $cfg.loggerAutostart) { return [bool]$cfg.loggerAutostart }
+  return (Test-RunValue)
+}
 function Start-Collector($cfg) {
   Write-Text (Join-Path $DataDir 'collector.ps1') $CollectorPs
   $c = Get-CollectorCommand ([int]$cfg.port)
-  New-Item -Path $RunKeyPath -Force -ErrorAction SilentlyContinue | Out-Null
-  Set-ItemProperty -Path $RunKeyPath -Name $RunValueName -Value $c.full
-  if (-not (Get-CollectorHealth ([int]$cfg.port))) { Start-Process -FilePath $c.file -ArgumentList $c.args -WindowStyle Hidden | Out-Null }
+  if (Get-AutostartWanted $cfg) { Set-RunValue $c.full }
+  if (-not (Get-CollectorHealth ([int]$cfg.port))) { Start-CollectorProcess $c }
+  if ($script:DryRun) { return $null }
   for ($i = 0; $i -lt 20; $i++) { $h = Get-CollectorHealth ([int]$cfg.port); if ($h) { return $h }; Start-Sleep -Milliseconds 500 }
   return $null
 }
@@ -670,26 +966,69 @@ function Stop-Collector($cfg) {
   $pidFile = Join-Path $DataDir 'collector.pid'
   if (Test-Path -LiteralPath $pidFile) {
     $cp = [int]((Get-Content -LiteralPath $pidFile -Raw).Trim())
-    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cp" -ErrorAction SilentlyContinue
-    if ($p -and [string]$p.CommandLine -like '*collector.ps1*') { Stop-Process -Id $cp -Force -ErrorAction SilentlyContinue; Say "  stopped collector (PID $cp)" }
-    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+    if (Stop-CollectorProcess $cp) { Say "  stopped collector (PID $cp)" }
+    Remove-OwnFile $pidFile
   }
-  Remove-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue
+  Remove-RunValue
+}
+function Set-LoggerAutostart($cfg, [bool]$on) {
+  if ($on) {
+    if (-not $cfg.loggerEnabled -or -not $cfg.port) { Warn 'The logger is not set up; turn it on first (-Logger on).'; return }
+    $cfg.loggerAutostart = $true; Save-Config $cfg
+    Set-RunValue (Get-CollectorCommand ([int]$cfg.port)).full
+    Good "  Logger autostart on: HKCU\...\Run\$RunValueName (Task Manager > Startup apps). Undo: -Autostart off"
+  } else {
+    $cfg.loggerAutostart = $false; Save-Config $cfg
+    Remove-RunValue
+    Good '  Logger autostart off (Run value removed). A running logger keeps running until you log off; -Logger off stops it now.'
+  }
+  Add-Journal 'autostart' @{ on = $on } | Out-Null
+}
+function Read-Consent([string]$q) {
+  # Explicit yes/no for opt-in features. Deliberately NOT answered by -Yes.
+  $a = Read-Host "$q [y/N]"
+  return ([string]$a).Trim().ToLower() -in 'y', 'yes', 'j', 'ja'
+}
+function Get-LoggerWanted($cfg, [bool]$interactive, [string]$modeName) {
+  # v1.0.2: the logger is opt-in. -NoLogger always wins; -Logger on opts in; an existing logger is kept as it is.
+  if ($NoLogger -or $Logger -eq 'off') { return $false }
+  if ($Logger -eq 'on') { return $true }
+  if ($cfg.loggerEnabled) { return $true }
+  if (-not $interactive) {
+    if ($modeName -eq 'baseline') { Say '  Logger not turned on (opt-in). The hook log still counts summary timers; add -Logger on to also record cost per request.' }
+    return $false
+  }
+  Say '  Optional local logger: a small PowerShell listener on 127.0.0.1 (this PC only) that records Claude Code''s own' 'Gray'
+  Say '  cost events (time, model, query_source, tokens, cost estimate; no prompts or responses). It sets 4 user' 'Gray'
+  Say '  variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_LOGS_EXPORTER, OTEL_EXPORTER_OTLP_LOGS_PROTOCOL/_ENDPOINT). -Logger off undoes it.' 'Gray'
+  $q = 'Turn on the local logger?'; if ($modeName -eq 'baseline') { $q = 'Turn on the local logger (recommended for a baseline measurement)?' }
+  return (Read-Consent $q)
+}
+function Get-AutostartChoice($cfg, [bool]$interactive) {
+  if ($Autostart -eq 'on') { return $true }
+  if ($Autostart -eq 'off') { return $false }
+  if ($null -ne $cfg.loggerAutostart -or (Test-RunValue)) { return (Get-AutostartWanted $cfg) }   # keep what is there
+  if (-not $interactive) { return $false }
+  Say "  Autostart would add the value $RunValueName to HKCU\...\CurrentVersion\Run (visible in Task Manager > Startup apps)" 'Gray'
+  Say '  so the logger starts hidden at every logon. Without it, the logger runs until you log off; run -Logger on to start it again.' 'Gray'
+  return (Read-Consent 'Start the logger at every logon?')
 }
 function Enable-Logger($cfg, [bool]$interactive) {
+  if ($NoLogger) { Say '  -NoLogger: logger configuration left alone.'; return $false }
   $conf = Get-OtelConflicts $cfg
   if ($conf.Count) {
     Warn 'Claude Code telemetry is already configured on this machine:'
     $conf | ForEach-Object { Say "   - $_" 'Yellow' }
     Say '   Turning on this logger would redirect Claude Code''s log events to this PC only, and settings.json/managed' 'Yellow'
     Say '   settings may override it anyway. Default is to leave telemetry alone (the hook still works).' 'Yellow'
-    if (-not ($interactive -and (AskYesNo 'Set up the local logger anyway?' $false))) { Say '  Logger skipped.'; return $false }
+    if (-not ($interactive -and (Read-Consent 'Set up the local logger anyway?'))) { Say '  Logger skipped.'; return $false }
   }
   if (-not $cfg.port -or -not ((Get-CollectorHealth ([int]$cfg.port)) -or (Test-PortFree ([int]$cfg.port)))) {
     $start = 47318; if ($Port) { $start = $Port }
     $cfg.port = Find-FreePort $start
     if (-not $cfg.port) { Warn 'No free local port found (47318-47367). Logger not set up.'; return $false }
   }
+  $auto = Get-AutostartChoice $cfg $interactive
   $vars = [ordered]@{
     CLAUDE_CODE_ENABLE_TELEMETRY     = '1'
     OTEL_LOGS_EXPORTER               = 'otlp'
@@ -699,23 +1038,27 @@ function Enable-Logger($cfg, [bool]$interactive) {
   foreach ($k in $vars.Keys) { Set-UserEnv $k $vars[$k] }
   $cfg.loggerVars = New-Object PSObject -Property $vars
   $cfg.loggerEnabled = $true
+  $cfg.loggerAutostart = $auto
   Save-Config $cfg
+  if (-not $auto) { Remove-RunValue }
   $h = Start-Collector $cfg
-  if ($h) { Good "  Logger running on 127.0.0.1:$($cfg.port) (PID $($h.pid)); starts hidden at every logon." }
-  else { Warn "Logger did not answer on 127.0.0.1:$($cfg.port). See $(Join-Path $DataDir 'collector.log')." }
-  Add-Journal 'logger_on' @{ port = $cfg.port; healthy = [bool]$h } | Out-Null
+  $as = 'no autostart (-Autostart on to start it at every logon)'; if ($auto) { $as = "starts hidden at every logon (HKCU Run value $RunValueName; -Autostart off removes it)" }
+  if ($h) { Good "  Logger running on 127.0.0.1:$($cfg.port) (PID $($h.pid)); $as." }
+  elseif (-not $script:DryRun) { Warn "Logger did not answer on 127.0.0.1:$($cfg.port). See $(Join-Path $DataDir 'collector.log')." }
+  Add-Journal 'logger_on' @{ port = $cfg.port; healthy = [bool]$h; autostart = $auto } | Out-Null
   return $true
 }
-function Disable-Logger($cfg) {
+function Disable-Logger($cfg, [switch]$Uninstalling) {
   Stop-Collector $cfg
   foreach ($k in $OtelVarNames) {
     $cur = Get-UserEnv $k; $ours = $null
     if ($cfg.loggerVars -and $cfg.loggerVars.PSObject.Properties[$k]) { $ours = [string]$cfg.loggerVars.$k }
     if ($cur -and $ours -and $cur -eq $ours) { Set-UserEnv $k $null }
-    elseif ($cur) { Say "  left $k=$cur alone (not set by this tool)" }
+    elseif ($cur) { Say "  left $k alone (not set by this tool; value not shown)" }
   }
-  $cfg.loggerEnabled = $false; $cfg.loggerVars = $null; Save-Config $cfg
-  Add-Journal 'logger_off' @{} | Out-Null
+  $cfg.loggerEnabled = $false; $cfg.loggerVars = $null; $cfg.loggerAutostart = $null
+  if (-not $Uninstalling) { Save-Config $cfg; Add-Journal 'logger_off' @{} | Out-Null }
+  elseif (Test-Path -LiteralPath $ConfigPath) { Save-Config $cfg }   # uninstall: record 'logger off' so a later install asks again; never creates a new file
   Good '  Logger stopped and removed from autostart. Data kept.'
 }
 
@@ -764,6 +1107,7 @@ function Set-TunerMode([string]$m, [double]$min, [bool]$wantLogger, [bool]$inter
     Warn 'Nothing was changed.'; return
   }
   Good "  Self-test OK: $($test.line -replace '^\S+\s+pid=\d+\s+','')"
+  $wantLogger = $wantLogger -and (Get-LoggerWanted $cfg $interactive $m)
   foreach ($d in $desk) {
     $dt = Test-HookLoads $d.Path $newBo
     if ($dt.ok) { Good "  Self-test OK for the desktop app's Claude Code $($d.Version)" } else { Warn "the desktop app's Claude Code $($d.Version) did not load the hook in the self-test: $($dt.out)" }
@@ -780,14 +1124,15 @@ function Set-TunerMode([string]$m, [double]$min, [bool]$wantLogger, [bool]$inter
     $id = Add-Journal 'reapply' @{ mode = $m; minutes = $min; tool_version = $ToolVersion; cc_version = $ver; desktop_cc = ($cfg.desktopCcVersions -join ','); rewrote_old_form = $wasOldForm }
     Good "  Mode unchanged; settings re-applied for $ToolName $ToolVersion. Logged at $(LocalStr (ParseIso $id))."
     if ($wasOldForm) { Say '  Already running Claude Code processes keep working. Terminals opened before now still hold the old form, so open a new terminal before running bun.' }
-    if ($wantLogger -and -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port)))) { Enable-Logger $cfg $interactive | Out-Null }
-    elseif ($cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+    if ($wantLogger -and ($Autostart -or -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port))))) { Enable-Logger $cfg $interactive | Out-Null }
+    elseif ($wantLogger -and $cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
     return
   }
   $id = Add-Journal 'mode' @{ mode = $m; minutes = $min; hook_mode = $hookMode; prev_mode = $prevMode; prev_minutes = $prevMin; cc_version = $ver; desktop_cc = ($cfg.desktopCcVersions -join ','); tool_version = $ToolVersion; bun_options = $newBo }
   Good "  Saved for your Windows account (user environment variables). Logged at $(LocalStr (ParseIso $id))."
-  if ($wantLogger -and -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port)))) { Enable-Logger $cfg $interactive | Out-Null }
-  elseif ($cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+  if ($wantLogger -and ($Autostart -or -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port))))) { Enable-Logger $cfg $interactive | Out-Null }
+  elseif ($wantLogger -and $cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+  if ($script:DryRun) { return }
   Show-RestartGuide
   Invoke-RestartCheck $id $interactive
 }
@@ -839,7 +1184,7 @@ function Invoke-RestartCheck([string]$refId, [bool]$interactive) {
     if ($a -eq 'D') {
       if (-not $hasDaemon) { Say '  No old daemon process in the list.' }
       if (AskYesNo '  This ends all background Claude Code sessions and their agents. Stop the daemon?' $false) {
-        $exe = Find-Claude; $r = Invoke-Isolated $exe @('daemon', 'stop', '--any') @{}; Say ('  ' + $r.out.Trim()); Start-Sleep -Seconds 2
+        $exe = Find-Claude; $r = Stop-ClaudeDaemon $exe; Say ('  ' + ([string]$r).Trim()); Start-Sleep -Seconds 2
         Add-Journal 'daemon_stop' @{ ref = $refId } | Out-Null
       }
     } elseif ($a -eq 'C') {
@@ -939,16 +1284,110 @@ function Show-Status {
     elseif (@($procs | Where-Object { $_.Kind -eq 'Desktop app (main)' }).Count) { Say "  Desktop app        : started after the last mode change, so its Code tab inherits the current setting" }
   }
   $conf = Get-OtelConflicts $cfg
-  if ($conf.Count) { Say '  Other telemetry settings found:' 'Yellow'; $conf | ForEach-Object { Say "   - $_" 'Yellow' } }
+  if ($conf.Count) { Say '  Other telemetry settings found (names only; values are never shown):' 'Yellow'; $conf | ForEach-Object { Say "   - $_" 'Yellow' } }
+  $lost = @(Get-LostStartupApps)
+  if ($lost.Count) { Warn "$($lost.Count) startup app(s) Windows still lists are missing from your Run key (see -ListLostStartupApps). v1.0.0/v1.0.1 of this tool could remove them when the logger was enabled." }
+}
+
+# ------------------------------------------------------------------ lost startup apps (read-only)
+$StartupApprovedPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+function Get-RegValueNames([string]$key) {
+  if (-not (Test-Path -LiteralPath $key)) { return @() }
+  $k = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue; if (-not $k) { return @() }
+  return @($k.GetValueNames() | Where-Object { $_ })
+}
+function Get-LostStartupApps {
+  # Windows keeps an enabled/disabled flag for every per-user Run entry under Explorer\StartupApproved\Run, and does not
+  # remove the flag when the Run value disappears. A name that has a flag but no Run value is a startup entry that
+  # was removed: by its app's uninstaller, by a settings change in the app, or by the v1.0.0/1.0.1 Run-key bug.
+  $run = @(Get-RegValueNames $RunKeyPath)
+  $out = @()
+  $k = $null; if (Test-Path -LiteralPath $StartupApprovedPath) { $k = Get-Item -LiteralPath $StartupApprovedPath -ErrorAction SilentlyContinue }
+  foreach ($n in @(Get-RegValueNames $StartupApprovedPath)) {
+    if ($run -contains $n) { continue }
+    $state = 'unknown'
+    try { $b = [byte[]]$k.GetValue($n); if ($b -and $b.Length) { if ($b[0] % 2 -eq 0) { $state = 'was enabled' } else { $state = 'was disabled' } } } catch {}
+    $out += [pscustomobject]@{ Name = $n; State = $state }
+  }
+  return $out
+}
+function Show-LostStartupApps {
+  Head 'Startup apps missing from HKCU\...\CurrentVersion\Run (read-only check, nothing is changed)'
+  $lost = @(Get-LostStartupApps)
+  $run = @(Get-RegValueNames $RunKeyPath)
+  Say "  Run key now has $($run.Count) value(s): $($run -join ', ')"
+  if (-not $lost.Count) { Good '  Nothing missing: every app in StartupApproved\Run still has its Run value.'; return }
+  Say "  $($lost.Count) name(s) Windows remembers as startup apps but that no longer have a Run value:"
+  $lost | Format-Table -AutoSize | Out-String -Width 160 | Write-Host
+  Say '  Some of these may simply have been uninstalled or switched off in the app itself. To restore the others,' 'Yellow'
+  Say '  turn "start with Windows" / "open at login" back on in each app''s own settings, or reinstall or repair it.' 'Yellow'
+  Say '  This tool does not recreate them: it cannot know the original command lines.' 'Yellow'
+}
+
+# ------------------------------------------------------------------ verify (read-only)
+function Get-FileSha256([string]$p) {
+  $sha = [Security.Cryptography.SHA256]::Create(); $stream = [IO.File]::OpenRead($p)
+  try { return (-join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })) }
+  finally { $stream.Dispose(); $sha.Dispose() }
+}
+function Get-TextSha256([string]$t) {
+  $sha = [Security.Cryptography.SHA256]::Create(); try { return (-join ($sha.ComputeHash($Utf8NoBom.GetBytes($t)) | ForEach-Object { $_.ToString('x2') })) } finally { $sha.Dispose() }
+}
+function Invoke-Verify {
+  Head "$ToolName $ToolVersion - verify (read-only)"
+  $self = $PSCommandPath; if (-not $self) { $self = $MyInvocation.ScriptName }
+  $ok = $true
+  if ($self -and (Test-Path -LiteralPath $self)) {
+    $h = Get-FileSha256 $self
+    Say "  This file          : $self"
+    Say "  SHA256             : $h"
+    if ($ExpectedHash) {
+      if ($h -eq $ExpectedHash.Trim().ToLower()) { Good '  Matches -ExpectedHash.' } else { Warn "does NOT match -ExpectedHash $ExpectedHash. Do not run it; download it again from the release."; $ok = $false }
+    } else { Say "  Compare it with SHA256SUMS on https://github.com/omgapnt/claude-summary-tuner/releases/tag/v$ToolVersion (or pass -ExpectedHash <hash>)." }
+    $sig = $null
+    if (Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue) { $sig = Get-AuthenticodeSignature -LiteralPath $self -ErrorAction SilentlyContinue }
+    if ($sig) { Say "  Authenticode       : $($sig.Status) (the script is not code-signed; the SHA256 above is how you check it)" }
+  } else { Warn 'could not find the path of this script file.'; $ok = $false }
+  # src/hook.js in the repo uses LF line endings and ends with a newline; the downloaded script uses CRLF. Normalise so the
+  # printed hash can be compared directly with sha256(src/hook.js) at the release tag.
+  Say "  Embedded hook      : sha256 $(Get-TextSha256 ((($HookJs -replace "`r`n", "`n").TrimEnd("`n")) + "`n")) (equals sha256 of src/hook.js in the repo at tag v$ToolVersion)"
+  $cfg = Get-Config
+  foreach ($f in @(@($cfg.hookPath, $HookJs, 'hook file on disk'), @((Join-Path $DataDir 'collector.ps1'), $CollectorPs, 'logger script on disk'))) {
+    if (-not $f[0] -or -not (Test-Path -LiteralPath $f[0])) { Say "  $($f[2]) : not present"; continue }
+    $disk = [IO.File]::ReadAllText($f[0])
+    if ($disk -eq $f[1]) { Good "  $($f[2]) : identical to the copy embedded in this file ($($f[0]))" }
+    elseif ($disk -match '^// Removed by ') { Say "  $($f[2]) : do-nothing stub left by an uninstall ($($f[0]))" }
+    else { Warn "$($f[2]) differs from the copy embedded in this file ($($f[0])). It may be from another version; re-run your mode to replace it."; $ok = $false }
+  }
+  if ($ok) { Good '  Verify: OK' } else { Warn 'Verify: see the warnings above.' }
+  return $ok
+}
+
+# ------------------------------------------------------------------ -WhatIf without an action: inventory
+function Show-WhatIfOverview {
+  $cfg = Get-Config
+  Head "$ToolName $ToolVersion - what this tool can change (-WhatIf: nothing is changed)"
+  Say "  Files     : $DataDir  (hook, config, journal, logs, reports; -DeleteData removes recorded files; legacy/untracked files are kept)"
+  Say "  User vars : BUN_OPTIONS (adds --preload=<hook>), $($TunerVars -join ', ')"
+  Say "              logger only: $($OtelVarNames -join ', ')"
+  Say "  Registry  : only $RunKeyPath\$RunValueName, and only if you turn on logger autostart"
+  Say '  Processes : claude.exe --version (self-test); the logger (only if you turn it on); claude -p runs in -Replicate'
+  Say '  Network   : the logger listens on 127.0.0.1 only; the script itself makes no outbound connections'
+  Head 'Current state (names only for telemetry variables)'
+  foreach ($n in @('BUN_OPTIONS') + $TunerVars + $OtelVarNames) { Say ("  {0,-36}: {1}" -f $n, $(if (Get-UserEnv $n) { 'set' } else { 'not set' })) }
+  Say "  Run value $RunValueName : $(if (Test-RunValue) { 'present' } else { 'not present' })"
+  Say "  Mode saved: $(if ($cfg.mode) { $cfg.mode } else { 'not installed' }); logger $(if ($cfg.loggerEnabled) { 'on' } else { 'off' })"
+  Say '  Add an action to see exactly what it would change, e.g. -Mode off -WhatIf or -Logger on -WhatIf.'
 }
 
 # ------------------------------------------------------------------ uninstall
 function Invoke-Uninstall([bool]$interactive) {
   $cfg = Get-Config
+  $ownershipBefore = Get-Ownership
   Head 'Uninstall'
   $delete = $false
-  if ($DeleteData) { $delete = $true } elseif ($KeepData) { $delete = $false } elseif ($interactive) { $delete = AskYesNo "Also delete the measurement data in $DataDir ?" $false }
-  if ($cfg.loggerEnabled -or (Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue)) { Disable-Logger $cfg }
+  if ($DeleteData) { $delete = $true } elseif ($KeepData) { $delete = $false } elseif ($interactive -and -not $Yes) { $delete = Read-Consent "Also delete recorded tool files in $DataDir ? (untracked data stays)" }
+  if ($cfg.loggerEnabled -or (Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue)) { Disable-Logger $cfg -Uninstalling }
   else { Stop-Collector $cfg }
   $bo = Get-UserEnv 'BUN_OPTIONS'
   if ($bo) { $rest = Remove-OurPreload $bo; Set-UserEnv 'BUN_OPTIONS' $rest; if ($rest) { Say "  BUN_OPTIONS kept with: $rest" } else { Say '  BUN_OPTIONS removed' } }
@@ -957,14 +1396,15 @@ function Invoke-Uninstall([bool]$interactive) {
   $stub = "// Removed by $ToolName. Running Claude Code processes may still list this file in BUN_OPTIONS;`n// it does nothing. Delete it after every Claude Code process has been restarted.`n"
   foreach ($hp in @($cfg.hookPath)) {
     if (-not $hp -or -not (Test-Path -LiteralPath $hp)) { continue }
+    if (-not (Test-OwnedFile $hp)) { Warn "Untracked hook preserved for manual cleanup: $hp"; continue }
     if ($running.Count) { Write-Text $hp $stub; Say "  $($running.Count) Claude process(es) still run with the old settings, so the hook file was replaced by a do-nothing stub instead of deleted (a missing preload file would stop Claude Code from starting): $hp" 'Yellow' }
-    else { Remove-Item -LiteralPath $hp -Force; Say "  deleted $hp" }
+    else { Remove-OwnFile $hp $hp; Say "  deleted $hp" }
   }
-  Add-Journal 'uninstall' @{ deleted_data = $delete } | Out-Null
+  if (Test-OwnedFile $JournalPath) { Add-Journal 'uninstall' @{ deleted_data = $delete } | Out-Null }
   if ($delete) {
-    Get-ChildItem -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $cfg.hookPath } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    if (-not (Get-ChildItem -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue }
-    Say "  data deleted"
+    # Only this tool's own files are deleted (see Remove-OwnData); anything else in the folder is left alone.
+    $keep = $null; if ($running.Count) { $keep = $cfg.hookPath }
+    if (Remove-OwnData $keep $ownershipBefore) { Say '  Recorded tool files deleted; untracked files and directories preserved.' }
   } else { Say "  data kept in $DataDir (reports still work: run with -Report)" }
   Good 'Uninstalled. Restart Claude Code sessions, terminals, the daemon and the desktop app for it to take full effect.'
 }
@@ -1121,7 +1561,7 @@ function New-Report {
   $out = $ReportTo; if (-not $out) { $out = Join-Path $DataDir ('report-' + (Get-Date).ToString('yyyyMMdd-HHmm', $Inv) + '.html') }
   Ensure-Dir (Split-Path $out -Parent); Write-Text $out (Hide-UserPaths $sb.ToString())   # safety net for any path left
   Good "  HTML report: $out"
-  if (-not $NoOpen) { try { Invoke-Item -LiteralPath $out } catch {} }
+  if (-not $NoOpen -and -not $script:DryRun) { try { Invoke-Item -LiteralPath $out } catch {} }
   return $out
 }
 
@@ -1175,8 +1615,7 @@ function Invoke-Replicate([bool]$interactive) {
     $saved = @{}; foreach ($k in $envO.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process'); [Environment]::SetEnvironmentVariable($k, $envO[$k], 'Process') }
     $t0 = Get-Date
     try {
-      $p = Start-Process -FilePath $exe -ArgumentList $argStr -WorkingDirectory $dir -RedirectStandardInput $inF -RedirectStandardOutput $outF -RedirectStandardError $errF -NoNewWindow -PassThru
-      if (-not $p.WaitForExit(900000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Warn "[$arm] timed out after 15 min and was stopped." }
+      if (-not (Start-ReplicateChild $exe $argStr $dir $inF $outF $errF)) { Warn "[$arm] timed out after 15 min and was stopped." }
     } finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
     $secs = [int]((Get-Date) - $t0).TotalSeconds
     $d = ''; if (Test-Path -LiteralPath $dbg) { $d = [IO.File]::ReadAllText($dbg) }
@@ -1232,7 +1671,7 @@ function Show-Menu {
   Write-Host "  Current: $cur; logger $(if ($cfg.loggerEnabled) { 'on' } else { 'off' })" -ForegroundColor DarkGray
   if ($cfg.mode -and (Test-OldPreloadForm (Get-UserEnv 'BUN_OPTIONS'))) { Write-Host '  Upgrade note: choose your current mode again once to rewrite BUN_OPTIONS as --preload=<path> (fixes standalone bun install).' -ForegroundColor Yellow }
   Write-Host ''
-  Write-Host '   1  Baseline - measure only (hook counts, summaries unchanged) + logger'
+  Write-Host '   1  Baseline - measure only (hook counts, summaries unchanged); asks about the optional logger'
   Write-Host '   2  Slow     - one summary per agent at most every 5 minutes'
   Write-Host '   3  Custom   - choose the minutes yourself'
   Write-Host '   4  Off      - no agent summaries at all (agent panel status stops updating)'
@@ -1240,8 +1679,9 @@ function Show-Menu {
   Write-Host '   6  Restart check (confirm all Claude Code processes picked up the change)'
   Write-Host '   7  Report (HTML with charts)'
   Write-Host '   8  Replicate Flamerix''s test (A/B runs, costs a few cents of Haiku)'
-  Write-Host '   9  Logger on/off'
-  Write-Host '  10  Uninstall everything'
+  Write-Host '   9  Logger on/off (opt-in; asks separately about autostart)'
+  Write-Host '  11  List startup apps missing from the Run key (read-only)'
+  Write-Host '  10  Uninstall (untracked data is preserved)'
   Write-Host '   Q  Quit'
   return (Ask '  Choose' 'Q').ToUpper()
 }
@@ -1250,7 +1690,7 @@ function Invoke-Interactive {
     $c = Show-Menu; $cfg = Get-Config
     $wantLogger = -not $NoLogger
     switch ($c) {
-      '1' { Set-TunerMode 'baseline' 0 $true $true }
+      '1' { Set-TunerMode 'baseline' 0 $wantLogger $true }
       '2' { Set-TunerMode 'slow' 5 $wantLogger $true }
       '3' { $m = Read-Minutes; if ($m) { Set-TunerMode 'slow' $m $wantLogger $true } }
       '4' { Set-TunerMode 'off' 0 $wantLogger $true }
@@ -1260,25 +1700,78 @@ function Invoke-Interactive {
       '8' { Invoke-Replicate $true }
       '9' { if ($cfg.loggerEnabled) { Disable-Logger $cfg } else { Enable-Logger $cfg $true | Out-Null } }
       '10' { if (AskYesNo 'Remove the hook, settings, logger and autostart?' $false) { Invoke-Uninstall $true } }
+      '11' { Show-LostStartupApps }
       'Q' { return }
       default { Warn 'Unknown choice.' }
     }
   }
 }
 
+
+function Show-ActionPlan {
+  Show-WhatIfOverview
+  $cfg = Get-Config
+  if ($Mode) {
+    Write-Plan "install hook, update mode/config/journal in $DataDir and the four hook user variables"
+    Write-Plan 'check Claude version and hook loading during the real run; no executable is run now'
+    if (-not $NoLogger -and $Logger -ne 'off' -and ($Logger -eq 'on' -or $cfg.loggerEnabled)) {
+      Write-Plan 'configure/start the local logger; check telemetry conflicts and port availability during the real run'
+    }
+  } elseif ($Logger -eq 'on') {
+    Write-Plan 'configure four telemetry user variables, write collector/config/journal, and start the loopback logger'
+    Write-Plan 'check telemetry conflicts and choose a free port during the real run (no socket is opened now)'
+  } elseif ($Logger -eq 'off') {
+    Write-Plan 'stop the owned collector, remove its Run value and matching telemetry user variables, update config/journal'
+  } elseif ($Autostart) {
+    Write-Plan "set logger autostart $Autostart (only its own Run value); update config/journal"
+  } elseif ($Uninstall) {
+    Write-Plan 'remove the hook preload and tuner variables; stop the owned logger and remove its Run value'
+    if ($DeleteData) {
+      $m = Get-Ownership
+      if ($m) { foreach ($f in @($m.files)) { Write-Plan "delete recorded file $(Join-Path $DataDir $f) unless a running session needs the hook stub" } }
+      else { Say '  No valid ownership record: untracked/legacy files would be preserved.' }
+    } else { Say '  Measurement files would be kept; deletion requires -DeleteData or a separate explicit answer in a real interactive run.' }
+  } elseif ($Replicate) {
+    Write-Plan 'only after explicit live-run approval: launch usage-bearing Claude test arms and save results in the data directory'
+  } elseif ($Report) {
+    Write-Plan "generate HTML report (destination: $(if ($ReportTo) { $ReportTo } else { $DataDir })); opening it is deferred to the real run"
+  } elseif ($Status) {
+    Say '  A real status check may run Claude self-tests and cache binary checks. Preview skips those checks.'
+  } elseif ($CheckRestart) {
+    Write-Plan 'check old Claude sessions; record effectiveness when ready; daemon stop requires separate explicit consent'
+  } elseif ($Verify -or $ListLostStartupApps) {
+    Say '  The selected action is read-only; preview shows the inventory only.'
+  }
+  if ($NoLogger) { Say '  -NoLogger: no collector start, rewrite, or autostart action; existing logger left alone.' }
+  if ($Autostart -eq 'on' -and -not $NoLogger -and ($Logger -eq 'on' -or $Mode)) { Write-Plan 'enable logger autostart only if logger setup succeeds' }
+  if ($Autostart -eq 'off' -and ($Logger -eq 'on' -or $Mode)) { Write-Plan 'remove the tool logger Run value if logger setup is applied' }
+  Head "-WhatIf summary: $($script:Planned.Count) planned action(s). No child process, socket, or write was performed."
+}
+
 # ------------------------------------------------------------------ main
 if ($env:CST_NO_MAIN) { return }   # used by the test harness to load the functions only
 if ($env:OS -ne 'Windows_NT' -and -not $env:CST_ALLOW_NON_WINDOWS) { Write-Host 'This script is for Windows.'; exit 1 }
-if ($Mode) {
+if (@(@($Mode,$Status,$Report,$CheckRestart,$Replicate,$Uninstall,$Verify,$ListLostStartupApps) | Where-Object { [bool]$_ }).Count -gt 1) { Warn 'Choose only one primary action.'; exit 2 }
+if ($NoLogger -and ($Logger -eq 'on' -or $Autostart)) { Warn '-NoLogger conflicts with -Logger on or -Autostart.'; exit 2 }
+if ($Mode -and $Logger -eq 'off') { Warn 'Run -Logger off separately before changing mode, or use -NoLogger to leave logging alone.'; exit 2 }
+if ($DeleteData -and $KeepData) { Warn 'Choose either -DeleteData or -KeepData.'; exit 2 }
+if ($ExpectedHash -and -not $Verify) { Warn '-ExpectedHash requires -Verify.'; exit 2 }
+if ($Mode -in 'slow', 'custom' -and $Minutes -and ($Minutes -lt 0.5 -or $Minutes -gt 1440)) { Warn '-Minutes must be between 0.5 and 1440.'; exit 2 }
+if ($Mode -eq 'custom' -and -not $Minutes) { Warn '-Mode custom requires -Minutes.'; exit 2 }
+if ($script:DryRun) { Show-ActionPlan; return }
+if ($Verify) { if (-not (Invoke-Verify)) { exit 1 } }
+elseif ($ListLostStartupApps) { Show-LostStartupApps }
+elseif ($Mode) {
   $min = 0
   if ($Mode -eq 'slow') { $min = 5; if ($Minutes) { $min = $Minutes } }
   if ($Mode -eq 'custom') { if ($Minutes -lt 0.5 -or $Minutes -gt 1440) { Warn '-Mode custom needs -Minutes between 0.5 and 1440.'; exit 2 }; $min = $Minutes }
   $m = $Mode; if ($m -eq 'custom') { $m = 'slow' }
-  Set-TunerMode $m $min (($Mode -eq 'baseline') -or -not $NoLogger) $false
+  Set-TunerMode $m $min (-not $NoLogger) $false
 } elseif ($Logger) { $cfg = Get-Config; if ($Logger -eq 'on') { Enable-Logger $cfg $false | Out-Null } else { Disable-Logger $cfg } }
+elseif ($Autostart) { Set-LoggerAutostart (Get-Config) ($Autostart -eq 'on') }
 elseif ($CheckRestart) { Invoke-RestartCheck $null ([Environment]::UserInteractive -and -not $Yes) }
 elseif ($Status) { Show-Status }
 elseif ($Report) { New-Report | Out-Null }
 elseif ($Replicate) { Invoke-Replicate (-not $Yes) }
-elseif ($Uninstall) { Invoke-Uninstall (-not ($DeleteData -or $KeepData)) }
+elseif ($Uninstall) { Invoke-Uninstall (-not ($Yes -or $DeleteData -or $KeepData)) }
 else { Invoke-Interactive }

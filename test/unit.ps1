@@ -1,8 +1,13 @@
 # Unit tests for Claude-Summary-Tuner.ps1 (runs on Linux/macOS/Windows with PowerShell 7: pwsh ./test/unit.ps1).
 # Uses synthetic data only; writes to temp folders; regenerates test/fixtures/sample-report.html.
-$env:CST_NO_MAIN = '1'; $env:LOCALAPPDATA = '/tmp/cst-lad'; $env:USERPROFILE='/tmp/cst-home'; $env:TEMP='/tmp/cst-tmp'; New-Item -ItemType Directory -Force /tmp/cst-tmp | Out-Null
-$DataDirArg = '/tmp/cst-test-data'
-Remove-Item -Recurse -Force $DataDirArg -ErrorAction SilentlyContinue
+param([string]$TestRoot = [IO.Path]::GetTempPath())
+$ErrorActionPreference = 'Stop'
+$TestRoot = Join-Path ([IO.Path]::GetFullPath($TestRoot)) ('unit-' + [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($TestRoot)
+$env:CST_NO_MAIN = '1'
+$env:LOCALAPPDATA = Join-Path $TestRoot 'localappdata'; $env:USERPROFILE = Join-Path $TestRoot 'home'; $env:TEMP = Join-Path $TestRoot 'temp'
+[void][IO.Directory]::CreateDirectory($env:TEMP)
+$DataDirArg = Join-Path $TestRoot 'data'
 . (Join-Path $PSScriptRoot '../Claude-Summary-Tuner.ps1') -DataDir $DataDirArg -NoOpen
 $fail = 0
 function Check($name, $got, $exp) { if ("$got" -ceq "$exp") { Write-Host "PASS $name" } else { Write-Host "FAIL $name : got [$got] expected [$exp]"; $script:fail++ } }
@@ -88,5 +93,41 @@ Check 'report has no user name' ([bool]($html -match '(?i)zed99')) 'False'
 Check 'report has no Users path' ([bool]($html -match '(?i)[A-Z]:[\\/]Users[\\/](?!%USERNAME%)')) 'False'
 Check 'reapply does not split periods' ((@(Get-Periods (Read-Journal) ($ev | Sort-Object t))).label -join '|') 'baseline|slow 5 min'
 Copy-Item $out (Join-Path $PSScriptRoot 'fixtures/sample-report.html')
+# ---- v1.0.2: secrets are never printed
+Check 'secret name otel headers' (Show-EnvValue 'OTEL_EXPORTER_OTLP_HEADERS' 'Authorization=Bearer sk-123') '(set, value not shown)'
+Check 'secret name any otel' (Show-EnvValue 'OTEL_LOGS_EXPORTER' 'otlp') '(set, value not shown)'
+Check 'secret name api key' (Show-EnvValue 'MY_API_KEY' 'abc') '(set, value not shown)'
+Check 'secret name token' (Show-EnvValue 'GITHUB_TOKEN' 'abc') '(set, value not shown)'
+Check 'plain value shown' (Show-EnvValue 'BUN_OPTIONS' '--smol') "'--smol'"
+New-Item -ItemType Directory -Force (Join-Path $env:USERPROFILE '.claude') | Out-Null
+Set-Content -LiteralPath (Join-Path $env:USERPROFILE '.claude/settings.json') -Value '{"env":{"OTEL_EXPORTER_OTLP_HEADERS":"Authorization=Bearer sk-SECRET-42","OTEL_EXPORTER_OTLP_ENDPOINT":"https://otel.example.com"}}'
+$conf = (Get-OtelConflicts (Get-Config)) -join "`n"
+Check 'conflicts list names' ([bool]($conf -match 'OTEL_EXPORTER_OTLP_HEADERS')) 'True'
+Check 'conflicts hide header value' ([bool]($conf -match 'sk-SECRET-42|Bearer')) 'False'
+Check 'conflicts hide endpoint value' ([bool]($conf -match 'otel\.example\.com')) 'False'
+# Ownership/deletion and action-level safety tests are in security-regressions.ps1.
+# ---- v1.0.2: static checks on the script itself
+$tok = $null; $perr = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../Claude-Summary-Tuner.ps1'), [ref]$tok, [ref]$perr)
+$cmds = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+$forceNewItem = @($cmds | Where-Object { $_.GetCommandName() -eq 'New-Item' -and ($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Force' }) })
+Check 'no New-Item -Force anywhere (it recreates registry keys)' $forceNewItem.Count 0
+Check 'collector has no New-Item -Force' ([bool]($CollectorPs -match 'New-Item[^\r\n]*-Force')) 'False'
+$gate = 'Register-OwnFile', 'Ensure-Dir', 'Write-Text', 'Append-Text', 'Remove-OwnFile', 'Remove-OwnData', 'Set-UserEnv', 'Set-RunValue', 'Remove-RunValue', 'Start-CollectorProcess', 'Stop-CollectorProcess', 'Stop-ClaudeDaemon', 'Start-ReplicateChild'
+# Not persistent, reviewed: Process-scope variables for child processes, and the self-test's own temp file.
+$allowed = @('Invoke-Isolated|SetEnvironmentVariable', 'Invoke-Replicate|SetEnvironmentVariable', 'Test-HookLoads|Remove-Item')
+$writers = 'New-Item', 'Set-Item', 'Set-ItemProperty', 'New-ItemProperty', 'Remove-Item', 'Remove-ItemProperty', 'Move-Item', 'Copy-Item', 'Rename-Item', 'Set-Content', 'Add-Content', 'Out-File', 'Start-Process', 'Stop-Process', 'Set-ExecutionPolicy', 'Invoke-Expression', 'Invoke-WebRequest', 'Invoke-RestMethod'
+$members = 'WriteAllText', 'AppendAllText', 'WriteAllBytes', 'WriteAllLines', 'CreateDirectory', 'Delete', 'SetEnvironmentVariable', 'SetValue', 'DeleteValue', 'DeleteSubKeyTree', 'DownloadString', 'DownloadFile'
+function FuncOf($n) { $p = $n.Parent; while ($p) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $p.Name }; $p = $p.Parent }; return '(top level)' }
+$viol = @()
+foreach ($c in $cmds) { $nm = $c.GetCommandName(); if ($nm -in $writers) { $f = FuncOf $c; if ($f -notin $gate -and "$f|$nm" -notin $allowed) { $viol += "$f -> $nm (line $($c.Extent.StartLineNumber))" } } }
+foreach ($m in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true))) {
+  $nm = [string]$m.Member.Value; if ($nm -notin $members) { continue }
+  $f = FuncOf $m; if ($f -in $gate -or "$f|$nm" -in $allowed) { continue }
+  $viol += "$f -> .$nm (line $($m.Extent.StartLineNumber))"
+}
+if ($viol.Count) { $viol | ForEach-Object { Write-Host "  gate violation: $_" } }
+Check 'every persistent change goes through the CHANGE GATE' $viol.Count 0
+if ($env:OS -eq 'Windows_NT') { & (Join-Path $PSScriptRoot 'registry-windows.ps1'); if ($LASTEXITCODE) { $fail++ } } else { Write-Host 'SKIP registry test (Windows only: test/registry-windows.ps1)' }
 "FAILURES: $fail"
 if ($fail) { exit 1 }

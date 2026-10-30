@@ -44,6 +44,7 @@ function Set-TunerMode([string]$m, [double]$min, [bool]$wantLogger, [bool]$inter
     Warn 'Nothing was changed.'; return
   }
   Good "  Self-test OK: $($test.line -replace '^\S+\s+pid=\d+\s+','')"
+  $wantLogger = $wantLogger -and (Get-LoggerWanted $cfg $interactive $m)
   foreach ($d in $desk) {
     $dt = Test-HookLoads $d.Path $newBo
     if ($dt.ok) { Good "  Self-test OK for the desktop app's Claude Code $($d.Version)" } else { Warn "the desktop app's Claude Code $($d.Version) did not load the hook in the self-test: $($dt.out)" }
@@ -60,14 +61,15 @@ function Set-TunerMode([string]$m, [double]$min, [bool]$wantLogger, [bool]$inter
     $id = Add-Journal 'reapply' @{ mode = $m; minutes = $min; tool_version = $ToolVersion; cc_version = $ver; desktop_cc = ($cfg.desktopCcVersions -join ','); rewrote_old_form = $wasOldForm }
     Good "  Mode unchanged; settings re-applied for $ToolName $ToolVersion. Logged at $(LocalStr (ParseIso $id))."
     if ($wasOldForm) { Say '  Already running Claude Code processes keep working. Terminals opened before now still hold the old form, so open a new terminal before running bun.' }
-    if ($wantLogger -and -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port)))) { Enable-Logger $cfg $interactive | Out-Null }
-    elseif ($cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+    if ($wantLogger -and ($Autostart -or -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port))))) { Enable-Logger $cfg $interactive | Out-Null }
+    elseif ($wantLogger -and $cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
     return
   }
   $id = Add-Journal 'mode' @{ mode = $m; minutes = $min; hook_mode = $hookMode; prev_mode = $prevMode; prev_minutes = $prevMin; cc_version = $ver; desktop_cc = ($cfg.desktopCcVersions -join ','); tool_version = $ToolVersion; bun_options = $newBo }
   Good "  Saved for your Windows account (user environment variables). Logged at $(LocalStr (ParseIso $id))."
-  if ($wantLogger -and -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port)))) { Enable-Logger $cfg $interactive | Out-Null }
-  elseif ($cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+  if ($wantLogger -and ($Autostart -or -not ($cfg.loggerEnabled -and (Get-CollectorHealth ([int]$cfg.port))))) { Enable-Logger $cfg $interactive | Out-Null }
+  elseif ($wantLogger -and $cfg.loggerEnabled) { $h = Start-Collector $cfg; if ($h) { Say "  Logger already on (127.0.0.1:$($cfg.port))." } }
+  if ($script:DryRun) { return }
   Show-RestartGuide
   Invoke-RestartCheck $id $interactive
 }
@@ -119,7 +121,7 @@ function Invoke-RestartCheck([string]$refId, [bool]$interactive) {
     if ($a -eq 'D') {
       if (-not $hasDaemon) { Say '  No old daemon process in the list.' }
       if (AskYesNo '  This ends all background Claude Code sessions and their agents. Stop the daemon?' $false) {
-        $exe = Find-Claude; $r = Invoke-Isolated $exe @('daemon', 'stop', '--any') @{}; Say ('  ' + $r.out.Trim()); Start-Sleep -Seconds 2
+        $exe = Find-Claude; $r = Stop-ClaudeDaemon $exe; Say ('  ' + ([string]$r).Trim()); Start-Sleep -Seconds 2
         Add-Journal 'daemon_stop' @{ ref = $refId } | Out-Null
       }
     } elseif ($a -eq 'C') {
@@ -219,16 +221,110 @@ function Show-Status {
     elseif (@($procs | Where-Object { $_.Kind -eq 'Desktop app (main)' }).Count) { Say "  Desktop app        : started after the last mode change, so its Code tab inherits the current setting" }
   }
   $conf = Get-OtelConflicts $cfg
-  if ($conf.Count) { Say '  Other telemetry settings found:' 'Yellow'; $conf | ForEach-Object { Say "   - $_" 'Yellow' } }
+  if ($conf.Count) { Say '  Other telemetry settings found (names only; values are never shown):' 'Yellow'; $conf | ForEach-Object { Say "   - $_" 'Yellow' } }
+  $lost = @(Get-LostStartupApps)
+  if ($lost.Count) { Warn "$($lost.Count) startup app(s) Windows still lists are missing from your Run key (see -ListLostStartupApps). v1.0.0/v1.0.1 of this tool could remove them when the logger was enabled." }
+}
+
+# ------------------------------------------------------------------ lost startup apps (read-only)
+$StartupApprovedPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+function Get-RegValueNames([string]$key) {
+  if (-not (Test-Path -LiteralPath $key)) { return @() }
+  $k = Get-Item -LiteralPath $key -ErrorAction SilentlyContinue; if (-not $k) { return @() }
+  return @($k.GetValueNames() | Where-Object { $_ })
+}
+function Get-LostStartupApps {
+  # Windows keeps an enabled/disabled flag for every per-user Run entry under Explorer\StartupApproved\Run, and does not
+  # remove the flag when the Run value disappears. A name that has a flag but no Run value is a startup entry that
+  # was removed: by its app's uninstaller, by a settings change in the app, or by the v1.0.0/1.0.1 Run-key bug.
+  $run = @(Get-RegValueNames $RunKeyPath)
+  $out = @()
+  $k = $null; if (Test-Path -LiteralPath $StartupApprovedPath) { $k = Get-Item -LiteralPath $StartupApprovedPath -ErrorAction SilentlyContinue }
+  foreach ($n in @(Get-RegValueNames $StartupApprovedPath)) {
+    if ($run -contains $n) { continue }
+    $state = 'unknown'
+    try { $b = [byte[]]$k.GetValue($n); if ($b -and $b.Length) { if ($b[0] % 2 -eq 0) { $state = 'was enabled' } else { $state = 'was disabled' } } } catch {}
+    $out += [pscustomobject]@{ Name = $n; State = $state }
+  }
+  return $out
+}
+function Show-LostStartupApps {
+  Head 'Startup apps missing from HKCU\...\CurrentVersion\Run (read-only check, nothing is changed)'
+  $lost = @(Get-LostStartupApps)
+  $run = @(Get-RegValueNames $RunKeyPath)
+  Say "  Run key now has $($run.Count) value(s): $($run -join ', ')"
+  if (-not $lost.Count) { Good '  Nothing missing: every app in StartupApproved\Run still has its Run value.'; return }
+  Say "  $($lost.Count) name(s) Windows remembers as startup apps but that no longer have a Run value:"
+  $lost | Format-Table -AutoSize | Out-String -Width 160 | Write-Host
+  Say '  Some of these may simply have been uninstalled or switched off in the app itself. To restore the others,' 'Yellow'
+  Say '  turn "start with Windows" / "open at login" back on in each app''s own settings, or reinstall or repair it.' 'Yellow'
+  Say '  This tool does not recreate them: it cannot know the original command lines.' 'Yellow'
+}
+
+# ------------------------------------------------------------------ verify (read-only)
+function Get-FileSha256([string]$p) {
+  $sha = [Security.Cryptography.SHA256]::Create(); $stream = [IO.File]::OpenRead($p)
+  try { return (-join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })) }
+  finally { $stream.Dispose(); $sha.Dispose() }
+}
+function Get-TextSha256([string]$t) {
+  $sha = [Security.Cryptography.SHA256]::Create(); try { return (-join ($sha.ComputeHash($Utf8NoBom.GetBytes($t)) | ForEach-Object { $_.ToString('x2') })) } finally { $sha.Dispose() }
+}
+function Invoke-Verify {
+  Head "$ToolName $ToolVersion - verify (read-only)"
+  $self = $PSCommandPath; if (-not $self) { $self = $MyInvocation.ScriptName }
+  $ok = $true
+  if ($self -and (Test-Path -LiteralPath $self)) {
+    $h = Get-FileSha256 $self
+    Say "  This file          : $self"
+    Say "  SHA256             : $h"
+    if ($ExpectedHash) {
+      if ($h -eq $ExpectedHash.Trim().ToLower()) { Good '  Matches -ExpectedHash.' } else { Warn "does NOT match -ExpectedHash $ExpectedHash. Do not run it; download it again from the release."; $ok = $false }
+    } else { Say "  Compare it with SHA256SUMS on https://github.com/omgapnt/claude-summary-tuner/releases/tag/v$ToolVersion (or pass -ExpectedHash <hash>)." }
+    $sig = $null
+    if (Get-Command Get-AuthenticodeSignature -ErrorAction SilentlyContinue) { $sig = Get-AuthenticodeSignature -LiteralPath $self -ErrorAction SilentlyContinue }
+    if ($sig) { Say "  Authenticode       : $($sig.Status) (the script is not code-signed; the SHA256 above is how you check it)" }
+  } else { Warn 'could not find the path of this script file.'; $ok = $false }
+  # src/hook.js in the repo uses LF line endings and ends with a newline; the downloaded script uses CRLF. Normalise so the
+  # printed hash can be compared directly with sha256(src/hook.js) at the release tag.
+  Say "  Embedded hook      : sha256 $(Get-TextSha256 ((($HookJs -replace "`r`n", "`n").TrimEnd("`n")) + "`n")) (equals sha256 of src/hook.js in the repo at tag v$ToolVersion)"
+  $cfg = Get-Config
+  foreach ($f in @(@($cfg.hookPath, $HookJs, 'hook file on disk'), @((Join-Path $DataDir 'collector.ps1'), $CollectorPs, 'logger script on disk'))) {
+    if (-not $f[0] -or -not (Test-Path -LiteralPath $f[0])) { Say "  $($f[2]) : not present"; continue }
+    $disk = [IO.File]::ReadAllText($f[0])
+    if ($disk -eq $f[1]) { Good "  $($f[2]) : identical to the copy embedded in this file ($($f[0]))" }
+    elseif ($disk -match '^// Removed by ') { Say "  $($f[2]) : do-nothing stub left by an uninstall ($($f[0]))" }
+    else { Warn "$($f[2]) differs from the copy embedded in this file ($($f[0])). It may be from another version; re-run your mode to replace it."; $ok = $false }
+  }
+  if ($ok) { Good '  Verify: OK' } else { Warn 'Verify: see the warnings above.' }
+  return $ok
+}
+
+# ------------------------------------------------------------------ -WhatIf without an action: inventory
+function Show-WhatIfOverview {
+  $cfg = Get-Config
+  Head "$ToolName $ToolVersion - what this tool can change (-WhatIf: nothing is changed)"
+  Say "  Files     : $DataDir  (hook, config, journal, logs, reports; -DeleteData removes recorded files; legacy/untracked files are kept)"
+  Say "  User vars : BUN_OPTIONS (adds --preload=<hook>), $($TunerVars -join ', ')"
+  Say "              logger only: $($OtelVarNames -join ', ')"
+  Say "  Registry  : only $RunKeyPath\$RunValueName, and only if you turn on logger autostart"
+  Say '  Processes : claude.exe --version (self-test); the logger (only if you turn it on); claude -p runs in -Replicate'
+  Say '  Network   : the logger listens on 127.0.0.1 only; the script itself makes no outbound connections'
+  Head 'Current state (names only for telemetry variables)'
+  foreach ($n in @('BUN_OPTIONS') + $TunerVars + $OtelVarNames) { Say ("  {0,-36}: {1}" -f $n, $(if (Get-UserEnv $n) { 'set' } else { 'not set' })) }
+  Say "  Run value $RunValueName : $(if (Test-RunValue) { 'present' } else { 'not present' })"
+  Say "  Mode saved: $(if ($cfg.mode) { $cfg.mode } else { 'not installed' }); logger $(if ($cfg.loggerEnabled) { 'on' } else { 'off' })"
+  Say '  Add an action to see exactly what it would change, e.g. -Mode off -WhatIf or -Logger on -WhatIf.'
 }
 
 # ------------------------------------------------------------------ uninstall
 function Invoke-Uninstall([bool]$interactive) {
   $cfg = Get-Config
+  $ownershipBefore = Get-Ownership
   Head 'Uninstall'
   $delete = $false
-  if ($DeleteData) { $delete = $true } elseif ($KeepData) { $delete = $false } elseif ($interactive) { $delete = AskYesNo "Also delete the measurement data in $DataDir ?" $false }
-  if ($cfg.loggerEnabled -or (Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue)) { Disable-Logger $cfg }
+  if ($DeleteData) { $delete = $true } elseif ($KeepData) { $delete = $false } elseif ($interactive -and -not $Yes) { $delete = Read-Consent "Also delete recorded tool files in $DataDir ? (untracked data stays)" }
+  if ($cfg.loggerEnabled -or (Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue)) { Disable-Logger $cfg -Uninstalling }
   else { Stop-Collector $cfg }
   $bo = Get-UserEnv 'BUN_OPTIONS'
   if ($bo) { $rest = Remove-OurPreload $bo; Set-UserEnv 'BUN_OPTIONS' $rest; if ($rest) { Say "  BUN_OPTIONS kept with: $rest" } else { Say '  BUN_OPTIONS removed' } }
@@ -237,14 +333,15 @@ function Invoke-Uninstall([bool]$interactive) {
   $stub = "// Removed by $ToolName. Running Claude Code processes may still list this file in BUN_OPTIONS;`n// it does nothing. Delete it after every Claude Code process has been restarted.`n"
   foreach ($hp in @($cfg.hookPath)) {
     if (-not $hp -or -not (Test-Path -LiteralPath $hp)) { continue }
+    if (-not (Test-OwnedFile $hp)) { Warn "Untracked hook preserved for manual cleanup: $hp"; continue }
     if ($running.Count) { Write-Text $hp $stub; Say "  $($running.Count) Claude process(es) still run with the old settings, so the hook file was replaced by a do-nothing stub instead of deleted (a missing preload file would stop Claude Code from starting): $hp" 'Yellow' }
-    else { Remove-Item -LiteralPath $hp -Force; Say "  deleted $hp" }
+    else { Remove-OwnFile $hp $hp; Say "  deleted $hp" }
   }
-  Add-Journal 'uninstall' @{ deleted_data = $delete } | Out-Null
+  if (Test-OwnedFile $JournalPath) { Add-Journal 'uninstall' @{ deleted_data = $delete } | Out-Null }
   if ($delete) {
-    Get-ChildItem -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $cfg.hookPath } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    if (-not (Get-ChildItem -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue }
-    Say "  data deleted"
+    # Only this tool's own files are deleted (see Remove-OwnData); anything else in the folder is left alone.
+    $keep = $null; if ($running.Count) { $keep = $cfg.hookPath }
+    if (Remove-OwnData $keep $ownershipBefore) { Say '  Recorded tool files deleted; untracked files and directories preserved.' }
   } else { Say "  data kept in $DataDir (reports still work: run with -Report)" }
   Good 'Uninstalled. Restart Claude Code sessions, terminals, the daemon and the desktop app for it to take full effect.'
 }

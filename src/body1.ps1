@@ -29,15 +29,191 @@ function Ask([string]$q, [string]$def = '') {
   return $a.Trim()
 }
 function AskYesNo([string]$q, [bool]$def = $false) {
-  if ($Yes) { return $true }
   $d = 'y/N'; if ($def) { $d = 'Y/n' }
   $a = Read-Host "$q [$d]"
   if (-not $a) { return $def }
   return ($a.Trim().ToLower() -in 'y', 'yes', 'j', 'ja')
 }
-function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null } }
-function Write-Text([string]$p, [string]$t) { [IO.File]::WriteAllText($p, $t, $Utf8NoBom) }
-function Append-Text([string]$p, [string]$t) { [IO.File]::AppendAllText($p, $t, $Utf8NoBom) }
+
+# ================================================================== CHANGE GATE
+# EVERY persistent change this script can make goes through the functions in this section and nowhere else
+# (test/unit.ps1 parses the script and fails if any other function writes files, environment variables or the
+# registry, or starts/stops processes). That makes the whole "what can it change" review this one section:
+#   files      : Ensure-Dir, Write-Text, Append-Text, Remove-OwnFile, Remove-OwnData  (the data folder, see SECURITY.md)
+#   user env   : Set-UserEnv          (only BUN_OPTIONS, CC_AGENT_SUMMARY_*, and the 4 logger OTEL variables)
+#   registry   : Set-RunValue, Remove-RunValue  (only HKCU\...\Run\ClaudeSummaryTunerCollector, opt-in autostart)
+#   processes  : Start-CollectorProcess, Stop-CollectorProcess, Stop-ClaudeDaemon, Start-ReplicateChild
+# With -WhatIf / -DryRun each of them prints "WOULD ..." and does nothing.
+$script:DryRun = [bool]$WhatIf
+$script:Planned = New-Object System.Collections.Generic.List[string]
+function Write-Plan([string]$what) { $script:Planned.Add($what); Write-Host "  WOULD $what" -ForegroundColor Magenta }
+function Test-SecretName([string]$n) {
+  # Values of these variables are never printed (OTEL headers often hold an API key).
+  return [bool]($n -match '(?i)^OTEL_|HEADER|KEY|TOKEN|SECRET|PASSW|AUTH|CREDENTIAL|COOKIE')
+}
+function Show-EnvValue([string]$n, [string]$v) {
+  if ($null -eq $v -or $v -eq '') { return '(not set)' }
+  if (Test-SecretName $n) { return '(set, value not shown)' }
+  return "'$v'"
+}
+function Test-InsideDataDir([string]$p) {
+  if (-not $p) { return $false }
+  try { $full = [IO.Path]::GetFullPath($p); $root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/') } catch { return $false }
+  return $full.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase)
+}
+function Ensure-Dir([string]$p) {
+  # File system folders only (never a registry path).
+  if (Test-Path -LiteralPath $p) { return }
+  if ($script:DryRun) { Write-Plan "create folder $p"; return }
+  [void][IO.Directory]::CreateDirectory($p)
+}
+function Write-Text([string]$p, [string]$t) {
+  if ($script:DryRun) { Write-Plan "$(if (Test-Path -LiteralPath $p) { 'overwrite' } else { 'create' }) file $p ($($Utf8NoBom.GetByteCount($t)) bytes)"; return }
+  $created = -not (Test-Path -LiteralPath $p)
+  [IO.File]::WriteAllText($p, $t, $Utf8NoBom)
+  if ($created) { Register-OwnFile $p }
+}
+function Append-Text([string]$p, [string]$t) {
+  if ($script:DryRun) { Write-Plan "append $($Utf8NoBom.GetByteCount($t)) bytes to $p"; return }
+  $created = -not (Test-Path -LiteralPath $p)
+  [IO.File]::AppendAllText($p, $t, $Utf8NoBom)
+  if ($created) { Register-OwnFile $p }
+}
+# Ownership is recorded only when this process creates a new file. Existing files are never
+# adopted by filename. Old installations without this manifest are preserved by -DeleteData.
+function Test-SafeDataPath([string]$p) {
+  try {
+    $root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/')
+    $full = [IO.Path]::GetFullPath($p)
+    if ($root -notmatch '^[A-Za-z]:\\' -or $root.Length -le 3) { return $false }
+    foreach ($protected in @($env:USERPROFILE, $env:SystemRoot, $env:ProgramFiles, $env:ProgramData)) {
+      if ($protected -and $root -eq [IO.Path]::GetFullPath($protected).TrimEnd('\', '/')) { return $false }
+    }
+    if ($full -ne $root -and -not (Test-InsideDataDir $full)) { return $false }
+    $itemPath = $full
+    while ($itemPath) {
+      if (Test-Path -LiteralPath $itemPath) {
+        if ((Get-Item -LiteralPath $itemPath -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+      }
+      $parent = Split-Path $itemPath -Parent
+      if ($parent -eq $itemPath) { break }; $itemPath = $parent
+    }
+    return $true
+  } catch { return $false }
+}
+function Get-OwnershipPath { return (Join-Path $DataDir '.cst-owned-files.json') }
+function Get-Ownership {
+  $path = Get-OwnershipPath
+  if (-not (Test-SafeDataPath $path) -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+  try {
+    $m = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    $id = [guid]::Empty
+    if ($m.tool -cne 'Claude-Summary-Tuner' -or $m.schema -ne 1 -or
+        -not [guid]::TryParse([string]$m.installId, [ref]$id) -or
+        [string]$m.root -ne [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/')) { return $null }
+    foreach ($relative in @($m.files)) {
+      if (-not $relative -or [IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)' -or
+          -not (Test-SafeDataPath (Join-Path $DataDir $relative))) { return $null }
+    }
+    return $m
+  } catch { return $null }
+}
+function Register-OwnFile([string]$p) {
+  if ($script:DryRun -or -not (Test-InsideDataDir $p) -or -not (Test-SafeDataPath $p)) { return }
+  $path = Get-OwnershipPath; $m = Get-Ownership
+  if (-not $m) {
+    # Never replace an invalid/pre-existing marker or claim a legacy installation's files.
+    if (Test-Path -LiteralPath $path) { return }
+    $m = [pscustomobject]@{ tool = 'Claude-Summary-Tuner'; schema = 1; installId = [guid]::NewGuid().ToString(); root = [IO.Path]::GetFullPath($DataDir).TrimEnd('\', '/'); files = @() }
+  }
+  $relative = [IO.Path]::GetFullPath($p).Substring($m.root.Length + 1)
+  if ($relative -eq '.cst-owned-files.json') { return }
+  $m.files = @(@($m.files) + $relative | Select-Object -Unique)
+  [IO.File]::WriteAllText($path, ($m | ConvertTo-Json -Depth 4), $Utf8NoBom)
+}
+function Test-OwnedFile([string]$p) {
+  if (-not (Test-SafeDataPath $p)) { return $false }
+  $m = Get-Ownership; if (-not $m) { return $false }
+  return [bool](@($m.files) | Where-Object { [IO.Path]::GetFullPath((Join-Path $DataDir $_)) -eq [IO.Path]::GetFullPath($p) })
+}
+function Remove-OwnFile([string]$p, [string]$allowed) {
+  # $allowed is retained for compatibility; it can never authorize an outside/untracked file.
+  if (-not $p -or -not (Test-Path -LiteralPath $p -PathType Leaf)) { return }
+  if (-not (Test-OwnedFile $p)) { Warn "not deleting $p (not recorded as a file created by this installation)"; return }
+  if ($script:DryRun) { Write-Plan "delete $p"; return }
+  # Forget first: if deletion or the process fails, preserve the leftover file as untracked.
+  # This also prevents a subsequent uninstall claiming a new foreign file at the old path.
+  $m = Get-Ownership
+  $m.files = @($m.files | Where-Object { [IO.Path]::GetFullPath((Join-Path $DataDir $_)) -ne [IO.Path]::GetFullPath($p) })
+  [IO.File]::WriteAllText((Get-OwnershipPath), ($m | ConvertTo-Json -Depth 4), $Utf8NoBom)
+  Remove-Item -LiteralPath $p -Force -ErrorAction Stop
+}
+function Remove-OwnData([string]$keep, $ownership) {
+  # Use the snapshot taken BEFORE uninstall performs any writes. No glob or recursive deletion.
+  if (-not $ownership) { Warn 'No pre-existing ownership record; legacy/untracked data was preserved.'; return $false }
+  $current = Get-Ownership
+  if (-not $current -or $current.installId -ne $ownership.installId) { Warn 'Ownership changed; data was preserved.'; return $false }
+  foreach ($relative in @($ownership.files)) {
+    $p = Join-Path $DataDir $relative
+    if ($keep -and [IO.Path]::GetFullPath($p) -eq [IO.Path]::GetFullPath($keep)) { continue }
+    Remove-OwnFile $p
+  }
+  # Keep the manifest and directories. Unknown files (including future collector logs) stay untouched.
+  return $true
+}
+function Set-UserEnv([string]$n, [string]$v) {
+  # Per-user environment variable (HKCU\Environment), no admin. Only called for the names listed in SECURITY.md.
+  if ($script:DryRun) {
+    $cur = [Environment]::GetEnvironmentVariable($n, 'User')
+    if ([string]$cur -eq [string]$v) { return }
+    if ([string]::IsNullOrEmpty($v)) { Write-Plan "remove user variable $n (now $(Show-EnvValue $n $cur))" } else { Write-Plan "set user variable $n = $(Show-EnvValue $n $v) (now $(Show-EnvValue $n $cur))" }
+    return
+  }
+  if ([string]::IsNullOrEmpty($v)) { [Environment]::SetEnvironmentVariable($n, $null, 'User') }
+  else { [Environment]::SetEnvironmentVariable($n, $v, 'User') }
+}
+function Set-RunValue([string]$cmd) {
+  # The ONLY registry write: the opt-in logger autostart. Visible in Task Manager > Startup apps; -Autostart off removes it.
+  # v1.0.2 fix: v1.0.0/1.0.1 called "New-Item <Run key> -Force" here, which deletes and recreates the whole Run key
+  # and so removed every other app's startup entry. The key is now only created when it does not exist, never -Force.
+  if ($script:DryRun) { Write-Plan "set registry value $RunKeyPath\$RunValueName = $cmd"; return }
+  if (-not (Test-Path -LiteralPath $RunKeyPath)) { New-Item -Path $RunKeyPath | Out-Null }
+  Set-ItemProperty -LiteralPath $RunKeyPath -Name $RunValueName -Value $cmd
+}
+function Remove-RunValue {
+  if (-not (Get-ItemProperty -LiteralPath $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue)) { return }
+  if ($script:DryRun) { Write-Plan "delete registry value $RunKeyPath\$RunValueName"; return }
+  Remove-ItemProperty -LiteralPath $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue
+}
+function Start-CollectorProcess($c) {
+  # Starts the local logger (powershell.exe running the collector.ps1 this script wrote) without a console window,
+  # because it is a background listener. It shows in Task Manager as powershell.exe with collector.ps1 in its
+  # command line; -Logger off stops it.
+  if ($script:DryRun) { Write-Plan "start the logger: $($c.full)"; return }
+  Start-Process -FilePath $c.file -ArgumentList $c.args -WindowStyle Hidden | Out-Null
+}
+function Stop-CollectorProcess([int]$cp) {
+  # Require this installation's exact -File path, not a collector.ps1 substring.
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cp" -ErrorAction SilentlyContinue
+  $collectorPath = [IO.Path]::GetFullPath((Join-Path $DataDir 'collector.ps1'))
+  $fileArgument = '(?i)(?:^|\s)-File\s+"?' + [regex]::Escape($collectorPath) + '(?:"|\s|$)'
+  if (-not ($p -and $p.Name -eq 'powershell.exe' -and [string]$p.CommandLine -match $fileArgument)) { return $false }
+  if ($script:DryRun) { Write-Plan "stop the logger process (PID $cp)"; return $false }
+  Stop-Process -Id $cp -Force -ErrorAction SilentlyContinue; return $true
+}
+function Stop-ClaudeDaemon([string]$exe) {
+  # Only after you confirm in the restart check: runs Claude Code's own "claude daemon stop --any".
+  if ($script:DryRun) { Write-Plan "run: $exe daemon stop --any"; return '' }
+  return (Invoke-Isolated $exe @('daemon', 'stop', '--any') @{}).out
+}
+function Start-ReplicateChild([string]$exe, [string]$argStr, [string]$dir, [string]$inF, [string]$outF, [string]$errF) {
+  # -Replicate only: one "claude -p --model haiku" test run; stopped after 15 minutes if it hangs.
+  if ($script:DryRun) { Write-Plan "run: $exe $argStr"; return $true }
+  $p = Start-Process -FilePath $exe -ArgumentList $argStr -WorkingDirectory $dir -RedirectStandardInput $inF -RedirectStandardOutput $outF -RedirectStandardError $errF -NoNewWindow -PassThru
+  if (-not $p.WaitForExit(900000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; return $false }
+  return $true
+}
+# ================================================================== end of CHANGE GATE
 
 # ------------------------------------------------------------------ config + journal
 $ConfigPath = Join-Path $DataDir 'config.json'
@@ -47,7 +223,7 @@ function Get-Config {
   $c = $null
   if (Test-Path -LiteralPath $ConfigPath) { try { $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } catch { $c = $null } }
   if (-not $c) { $c = New-Object PSObject }
-  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache', 'ccVersions', 'desktopCcVersions', 'toolVersion') {
+  foreach ($k in 'hookPath', 'hookBunPath', 'port', 'loggerEnabled', 'mode', 'minutes', 'legacyLogs', 'loggerVars', 'anchorCache', 'ccVersions', 'desktopCcVersions', 'toolVersion', 'loggerAutostart') {
     if (-not $c.PSObject.Properties[$k]) { $c | Add-Member -NotePropertyName $k -NotePropertyValue $null }
   }
   return $c
@@ -70,10 +246,6 @@ function Read-Journal {
 
 # ------------------------------------------------------------------ user environment
 function Get-UserEnv([string]$n) { return [Environment]::GetEnvironmentVariable($n, 'User') }
-function Set-UserEnv([string]$n, [string]$v) {
-  if ([string]::IsNullOrEmpty($v)) { [Environment]::SetEnvironmentVariable($n, $null, 'User') }
-  else { [Environment]::SetEnvironmentVariable($n, $v, 'User') }
-}
 
 # BUN_OPTIONS is split on whitespace by Bun; quotes are NOT honoured (a quoted path silently fails to load)
 # and backslashes are eaten. So: forward slashes, no spaces, and keep every other option as it was.
@@ -113,6 +285,7 @@ function ConvertTo-BunPath([string]$p) {
   $f = $p -replace '\\', '/'
   if ($f -notmatch '\s') { return $f }
   try {
+    # Windows' own FileSystemObject is used only to read the 8.3 short name of a path that contains spaces.
     $fso = New-Object -ComObject Scripting.FileSystemObject
     $sp = $fso.GetFile($p).ShortPath
     if ($sp -and $sp -notmatch '\s') { return ($sp -replace '\\', '/') }
@@ -159,7 +332,9 @@ function Hide-UserPaths([string]$s) {
   return $s
 }
 function Invoke-Isolated([string]$exe, [string[]]$argv, [hashtable]$envOverride) {
-  # Runs a child with extra/removed variables in THIS process only; nothing persistent is touched.
+  if ($script:DryRun) { Write-Plan 'check Claude version/hook after approval (not executed in preview)'; return @{ out = ''; code = 0 } }
+  # Runs a child (claude.exe) with extra/removed variables set for THIS process only ('Process' scope, gone when
+  # the script exits); nothing persistent is touched. Used for 'claude --version' and the hook self-test.
   $saved = @{}
   foreach ($k in $envOverride.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process'); [Environment]::SetEnvironmentVariable($k, $envOverride[$k], 'Process') }
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -175,9 +350,11 @@ function Get-CCVersion([string]$exe) {
   return $null
 }
 function Test-HookLoads([string]$exe, [string]$bunOptions) {
+  if ($script:DryRun) { Write-Plan 'test hook loading after approval (not executed in preview)'; return @{ ok = $true; line = 'not executed (preview)'; out = '' } }
   $tmp = Join-Path $env:TEMP ("cst-selftest-" + [guid]::NewGuid().ToString('N') + '.log')
   $r = Invoke-Isolated $exe @('--version') @{ BUN_OPTIONS = $bunOptions; CC_AGENT_SUMMARY_MODE = 'pass'; CC_AGENT_SUMMARY_LOG = $tmp; CC_AGENT_SUMMARY_MIN_DELAY_MS = $null }
   $line = $null
+  # The hook itself writes this temp log (in %TEMP%) during the self-test; it is read and deleted right here.
   if (Test-Path -LiteralPath $tmp) { $line = (Get-Content -LiteralPath $tmp | Where-Object { $_ -match 'preload active' } | Select-Object -First 1); Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
   return @{ ok = [bool]$line; line = $line; out = $r.out.Trim() }
 }

@@ -49,8 +49,7 @@ function Invoke-Replicate([bool]$interactive) {
     $saved = @{}; foreach ($k in $envO.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process'); [Environment]::SetEnvironmentVariable($k, $envO[$k], 'Process') }
     $t0 = Get-Date
     try {
-      $p = Start-Process -FilePath $exe -ArgumentList $argStr -WorkingDirectory $dir -RedirectStandardInput $inF -RedirectStandardOutput $outF -RedirectStandardError $errF -NoNewWindow -PassThru
-      if (-not $p.WaitForExit(900000)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Warn "[$arm] timed out after 15 min and was stopped." }
+      if (-not (Start-ReplicateChild $exe $argStr $dir $inF $outF $errF)) { Warn "[$arm] timed out after 15 min and was stopped." }
     } finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
     $secs = [int]((Get-Date) - $t0).TotalSeconds
     $d = ''; if (Test-Path -LiteralPath $dbg) { $d = [IO.File]::ReadAllText($dbg) }
@@ -106,7 +105,7 @@ function Show-Menu {
   Write-Host "  Current: $cur; logger $(if ($cfg.loggerEnabled) { 'on' } else { 'off' })" -ForegroundColor DarkGray
   if ($cfg.mode -and (Test-OldPreloadForm (Get-UserEnv 'BUN_OPTIONS'))) { Write-Host '  Upgrade note: choose your current mode again once to rewrite BUN_OPTIONS as --preload=<path> (fixes standalone bun install).' -ForegroundColor Yellow }
   Write-Host ''
-  Write-Host '   1  Baseline - measure only (hook counts, summaries unchanged) + logger'
+  Write-Host '   1  Baseline - measure only (hook counts, summaries unchanged); asks about the optional logger'
   Write-Host '   2  Slow     - one summary per agent at most every 5 minutes'
   Write-Host '   3  Custom   - choose the minutes yourself'
   Write-Host '   4  Off      - no agent summaries at all (agent panel status stops updating)'
@@ -114,8 +113,9 @@ function Show-Menu {
   Write-Host '   6  Restart check (confirm all Claude Code processes picked up the change)'
   Write-Host '   7  Report (HTML with charts)'
   Write-Host '   8  Replicate Flamerix''s test (A/B runs, costs a few cents of Haiku)'
-  Write-Host '   9  Logger on/off'
-  Write-Host '  10  Uninstall everything'
+  Write-Host '   9  Logger on/off (opt-in; asks separately about autostart)'
+  Write-Host '  11  List startup apps missing from the Run key (read-only)'
+  Write-Host '  10  Uninstall (untracked data is preserved)'
   Write-Host '   Q  Quit'
   return (Ask '  Choose' 'Q').ToUpper()
 }
@@ -124,7 +124,7 @@ function Invoke-Interactive {
     $c = Show-Menu; $cfg = Get-Config
     $wantLogger = -not $NoLogger
     switch ($c) {
-      '1' { Set-TunerMode 'baseline' 0 $true $true }
+      '1' { Set-TunerMode 'baseline' 0 $wantLogger $true }
       '2' { Set-TunerMode 'slow' 5 $wantLogger $true }
       '3' { $m = Read-Minutes; if ($m) { Set-TunerMode 'slow' $m $wantLogger $true } }
       '4' { Set-TunerMode 'off' 0 $wantLogger $true }
@@ -134,25 +134,78 @@ function Invoke-Interactive {
       '8' { Invoke-Replicate $true }
       '9' { if ($cfg.loggerEnabled) { Disable-Logger $cfg } else { Enable-Logger $cfg $true | Out-Null } }
       '10' { if (AskYesNo 'Remove the hook, settings, logger and autostart?' $false) { Invoke-Uninstall $true } }
+      '11' { Show-LostStartupApps }
       'Q' { return }
       default { Warn 'Unknown choice.' }
     }
   }
 }
 
+
+function Show-ActionPlan {
+  Show-WhatIfOverview
+  $cfg = Get-Config
+  if ($Mode) {
+    Write-Plan "install hook, update mode/config/journal in $DataDir and the four hook user variables"
+    Write-Plan 'check Claude version and hook loading during the real run; no executable is run now'
+    if (-not $NoLogger -and $Logger -ne 'off' -and ($Logger -eq 'on' -or $cfg.loggerEnabled)) {
+      Write-Plan 'configure/start the local logger; check telemetry conflicts and port availability during the real run'
+    }
+  } elseif ($Logger -eq 'on') {
+    Write-Plan 'configure four telemetry user variables, write collector/config/journal, and start the loopback logger'
+    Write-Plan 'check telemetry conflicts and choose a free port during the real run (no socket is opened now)'
+  } elseif ($Logger -eq 'off') {
+    Write-Plan 'stop the owned collector, remove its Run value and matching telemetry user variables, update config/journal'
+  } elseif ($Autostart) {
+    Write-Plan "set logger autostart $Autostart (only its own Run value); update config/journal"
+  } elseif ($Uninstall) {
+    Write-Plan 'remove the hook preload and tuner variables; stop the owned logger and remove its Run value'
+    if ($DeleteData) {
+      $m = Get-Ownership
+      if ($m) { foreach ($f in @($m.files)) { Write-Plan "delete recorded file $(Join-Path $DataDir $f) unless a running session needs the hook stub" } }
+      else { Say '  No valid ownership record: untracked/legacy files would be preserved.' }
+    } else { Say '  Measurement files would be kept; deletion requires -DeleteData or a separate explicit answer in a real interactive run.' }
+  } elseif ($Replicate) {
+    Write-Plan 'only after explicit live-run approval: launch usage-bearing Claude test arms and save results in the data directory'
+  } elseif ($Report) {
+    Write-Plan "generate HTML report (destination: $(if ($ReportTo) { $ReportTo } else { $DataDir })); opening it is deferred to the real run"
+  } elseif ($Status) {
+    Say '  A real status check may run Claude self-tests and cache binary checks. Preview skips those checks.'
+  } elseif ($CheckRestart) {
+    Write-Plan 'check old Claude sessions; record effectiveness when ready; daemon stop requires separate explicit consent'
+  } elseif ($Verify -or $ListLostStartupApps) {
+    Say '  The selected action is read-only; preview shows the inventory only.'
+  }
+  if ($NoLogger) { Say '  -NoLogger: no collector start, rewrite, or autostart action; existing logger left alone.' }
+  if ($Autostart -eq 'on' -and -not $NoLogger -and ($Logger -eq 'on' -or $Mode)) { Write-Plan 'enable logger autostart only if logger setup succeeds' }
+  if ($Autostart -eq 'off' -and ($Logger -eq 'on' -or $Mode)) { Write-Plan 'remove the tool logger Run value if logger setup is applied' }
+  Head "-WhatIf summary: $($script:Planned.Count) planned action(s). No child process, socket, or write was performed."
+}
+
 # ------------------------------------------------------------------ main
 if ($env:CST_NO_MAIN) { return }   # used by the test harness to load the functions only
 if ($env:OS -ne 'Windows_NT' -and -not $env:CST_ALLOW_NON_WINDOWS) { Write-Host 'This script is for Windows.'; exit 1 }
-if ($Mode) {
+if (@(@($Mode,$Status,$Report,$CheckRestart,$Replicate,$Uninstall,$Verify,$ListLostStartupApps) | Where-Object { [bool]$_ }).Count -gt 1) { Warn 'Choose only one primary action.'; exit 2 }
+if ($NoLogger -and ($Logger -eq 'on' -or $Autostart)) { Warn '-NoLogger conflicts with -Logger on or -Autostart.'; exit 2 }
+if ($Mode -and $Logger -eq 'off') { Warn 'Run -Logger off separately before changing mode, or use -NoLogger to leave logging alone.'; exit 2 }
+if ($DeleteData -and $KeepData) { Warn 'Choose either -DeleteData or -KeepData.'; exit 2 }
+if ($ExpectedHash -and -not $Verify) { Warn '-ExpectedHash requires -Verify.'; exit 2 }
+if ($Mode -in 'slow', 'custom' -and $Minutes -and ($Minutes -lt 0.5 -or $Minutes -gt 1440)) { Warn '-Minutes must be between 0.5 and 1440.'; exit 2 }
+if ($Mode -eq 'custom' -and -not $Minutes) { Warn '-Mode custom requires -Minutes.'; exit 2 }
+if ($script:DryRun) { Show-ActionPlan; return }
+if ($Verify) { if (-not (Invoke-Verify)) { exit 1 } }
+elseif ($ListLostStartupApps) { Show-LostStartupApps }
+elseif ($Mode) {
   $min = 0
   if ($Mode -eq 'slow') { $min = 5; if ($Minutes) { $min = $Minutes } }
   if ($Mode -eq 'custom') { if ($Minutes -lt 0.5 -or $Minutes -gt 1440) { Warn '-Mode custom needs -Minutes between 0.5 and 1440.'; exit 2 }; $min = $Minutes }
   $m = $Mode; if ($m -eq 'custom') { $m = 'slow' }
-  Set-TunerMode $m $min (($Mode -eq 'baseline') -or -not $NoLogger) $false
+  Set-TunerMode $m $min (-not $NoLogger) $false
 } elseif ($Logger) { $cfg = Get-Config; if ($Logger -eq 'on') { Enable-Logger $cfg $false | Out-Null } else { Disable-Logger $cfg } }
+elseif ($Autostart) { Set-LoggerAutostart (Get-Config) ($Autostart -eq 'on') }
 elseif ($CheckRestart) { Invoke-RestartCheck $null ([Environment]::UserInteractive -and -not $Yes) }
 elseif ($Status) { Show-Status }
 elseif ($Report) { New-Report | Out-Null }
 elseif ($Replicate) { Invoke-Replicate (-not $Yes) }
-elseif ($Uninstall) { Invoke-Uninstall (-not ($DeleteData -or $KeepData)) }
+elseif ($Uninstall) { Invoke-Uninstall (-not ($Yes -or $DeleteData -or $KeepData)) }
 else { Invoke-Interactive }

@@ -1,18 +1,17 @@
 
 # ------------------------------------------------------------------ hook file
 function Install-HookFile($cfg) {
-  # Prefer the data folder. If its Bun-safe form is impossible (spaces and no 8.3 names), use ProgramData\<SID>.
-  $cands = @((Join-Path $DataDir $HookFileName))
-  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  if ($env:ProgramData) { $cands += (Join-Path (Join-Path (Join-Path $env:ProgramData 'cc-summary-tuner') $sid) $HookFileName) }
-  foreach ($p in $cands) {
-    try {
-      Ensure-Dir (Split-Path $p -Parent); Write-Text $p $HookJs
-      $bp = ConvertTo-BunPath $p
-      if ($bp -and $bp -match '^[A-Za-z]:/[^\s"'']+$') { $cfg.hookPath = $p; $cfg.hookBunPath = $bp; return $true }
-      Warn "Path '$p' contains spaces and has no short (8.3) name; trying another location."
-    } catch { Warn "Could not write $p : $($_.Exception.Message)" }
-  }
+  # The hook lives in the data folder (%LOCALAPPDATA%\cc-summary-tuner by default). Bun cannot load a preload path
+  # with spaces, so a path with spaces falls back to its 8.3 short name. v1.0.2 removed the old shared fallback
+  # (%ProgramData%\cc-summary-tuner\<SID>): another local user could pre-create that folder and plant code there.
+  $p = Join-Path $DataDir $HookFileName
+  try {
+    Ensure-Dir $DataDir; Write-Text $p $HookJs
+    if ($script:DryRun -and -not (Test-Path -LiteralPath $p)) { $bp = $p -replace '\\', '/' } else { $bp = ConvertTo-BunPath $p }
+    if ($bp -and $bp -match '^[A-Za-z]:/[^\s"'']+$') { $cfg.hookPath = $p; $cfg.hookBunPath = $bp; return $true }
+    Warn "The data folder path '$DataDir' contains spaces and has no short (8.3) name, so Bun cannot load the hook from it."
+    Warn 'Run the script again with -DataDir pointing to a folder without spaces that only your account can write to (for example inside your own profile).'
+  } catch { Warn "Could not write $p : $($_.Exception.Message)" }
   return $false
 }
 
@@ -86,7 +85,7 @@ function Get-OtelConflicts($cfg) {
     foreach ($k in $vars.Keys) {
       if ($k -match '^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$|BETA_TRACING_ENDPOINT$)') {
         if ($scope -eq 'User' -and $ours.ContainsKey($k) -and $ours[$k] -eq [string]$vars[$k]) { continue }
-        $found += "$scope environment: $k=$($vars[$k])"
+        $found += "$scope environment: $k (value not shown)"
       }
     }
   }
@@ -95,7 +94,7 @@ function Get-OtelConflicts($cfg) {
     if ($f -and (Test-Path -LiteralPath $f)) {
       try {
         $j = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
-        if ($j.env) { foreach ($p in $j.env.PSObject.Properties) { if ($p.Name -match '^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$)') { $found += "$f : env.$($p.Name)=$($p.Value)" } } }
+        if ($j.env) { foreach ($p in $j.env.PSObject.Properties) { if ($p.Name -match '^(OTEL_|CLAUDE_CODE_ENABLE_TELEMETRY$)') { $found += "$f : env.$($p.Name) (value not shown)" } } }
         if ($j.otelHeadersHelper) { $found += "$f : otelHeadersHelper is set" }
       } catch { if ($f -ne $settings) { $found += "$f exists (could not parse)" } }
     }
@@ -106,17 +105,28 @@ function Get-OtelConflicts($cfg) {
 
 # ------------------------------------------------------------------ collector
 function Test-PortFree([int]$p) {
-  try { $l = New-Object Net.HttpListener; $l.Prefixes.Add("http://127.0.0.1:$p/"); $l.Start(); $l.Stop(); $l.Close() } catch { return $false }
+  if ($script:DryRun) { return $true }
+  # Binds 127.0.0.1:<port> for a moment to see whether it is free, then releases it. Loopback only.
   try { $t = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, $p); $t.Start(); $t.Stop() } catch { return $false }
   return $true
 }
 function Find-FreePort([int]$start) { for ($p = $start; $p -lt $start + 50; $p++) { if (Test-PortFree $p) { return $p } }; return 0 }
 function Get-CollectorHealth([int]$p) {
+  if ($script:DryRun) { return $null }
   if (-not $p) { return $null }
-  try { $wc = New-Object Net.WebClient; $wc.Proxy = $null; $j = $wc.DownloadString("http://127.0.0.1:$p/health"); $wc.Dispose(); $o = $j | ConvertFrom-Json; if ($o.app -eq 'claude-summary-tuner') { return $o } } catch {}
+  # Asks OUR logger on 127.0.0.1 (this PC) for its status. This is the only HTTP request the script makes, and
+  # it never leaves the machine (proxy disabled so it cannot be routed anywhere else).
+  try {
+    $rq = [Net.HttpWebRequest]::Create("http://127.0.0.1:$p/health"); $rq.Proxy = $null; $rq.Timeout = 2000
+    $rs = $rq.GetResponse(); $sr = New-Object IO.StreamReader($rs.GetResponseStream()); $j = $sr.ReadToEnd(); $sr.Dispose(); $rs.Close()
+    $o = $j | ConvertFrom-Json; if ($o.app -eq 'claude-summary-tuner') { return $o }
+  } catch { Write-Verbose "no logger on port $p" }
   return $null
 }
 function Get-CollectorCommand([int]$p) {
+  # The exact command line used to start the logger (and, only if you enable autostart, stored in the Run value).
+  # -ExecutionPolicy Bypass applies to this one process only; -WindowStyle Hidden / conhost --headless keep a
+  # background listener from leaving a console window open. Nothing else is started.
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $script = Join-Path $DataDir 'collector.ps1'
   $psArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -DataDir `"$DataDir`" -Port $p"
@@ -127,12 +137,19 @@ function Get-CollectorCommand([int]$p) {
   }
   return @{ file = $ps; args = $psArgs; full = "`"$ps`" $psArgs" }
 }
+function Test-RunValue { return [bool](Get-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue) }
+function Get-AutostartWanted($cfg) {
+  # v1.0.2: autostart is opt-in. Installs from v1.0.0/1.0.1 that already have the Run value keep it (it is never
+  # removed behind your back); -Autostart off removes it.
+  if ($null -ne $cfg.loggerAutostart) { return [bool]$cfg.loggerAutostart }
+  return (Test-RunValue)
+}
 function Start-Collector($cfg) {
   Write-Text (Join-Path $DataDir 'collector.ps1') $CollectorPs
   $c = Get-CollectorCommand ([int]$cfg.port)
-  New-Item -Path $RunKeyPath -Force -ErrorAction SilentlyContinue | Out-Null
-  Set-ItemProperty -Path $RunKeyPath -Name $RunValueName -Value $c.full
-  if (-not (Get-CollectorHealth ([int]$cfg.port))) { Start-Process -FilePath $c.file -ArgumentList $c.args -WindowStyle Hidden | Out-Null }
+  if (Get-AutostartWanted $cfg) { Set-RunValue $c.full }
+  if (-not (Get-CollectorHealth ([int]$cfg.port))) { Start-CollectorProcess $c }
+  if ($script:DryRun) { return $null }
   for ($i = 0; $i -lt 20; $i++) { $h = Get-CollectorHealth ([int]$cfg.port); if ($h) { return $h }; Start-Sleep -Milliseconds 500 }
   return $null
 }
@@ -140,26 +157,69 @@ function Stop-Collector($cfg) {
   $pidFile = Join-Path $DataDir 'collector.pid'
   if (Test-Path -LiteralPath $pidFile) {
     $cp = [int]((Get-Content -LiteralPath $pidFile -Raw).Trim())
-    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cp" -ErrorAction SilentlyContinue
-    if ($p -and [string]$p.CommandLine -like '*collector.ps1*') { Stop-Process -Id $cp -Force -ErrorAction SilentlyContinue; Say "  stopped collector (PID $cp)" }
-    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+    if (Stop-CollectorProcess $cp) { Say "  stopped collector (PID $cp)" }
+    Remove-OwnFile $pidFile
   }
-  Remove-ItemProperty -Path $RunKeyPath -Name $RunValueName -ErrorAction SilentlyContinue
+  Remove-RunValue
+}
+function Set-LoggerAutostart($cfg, [bool]$on) {
+  if ($on) {
+    if (-not $cfg.loggerEnabled -or -not $cfg.port) { Warn 'The logger is not set up; turn it on first (-Logger on).'; return }
+    $cfg.loggerAutostart = $true; Save-Config $cfg
+    Set-RunValue (Get-CollectorCommand ([int]$cfg.port)).full
+    Good "  Logger autostart on: HKCU\...\Run\$RunValueName (Task Manager > Startup apps). Undo: -Autostart off"
+  } else {
+    $cfg.loggerAutostart = $false; Save-Config $cfg
+    Remove-RunValue
+    Good '  Logger autostart off (Run value removed). A running logger keeps running until you log off; -Logger off stops it now.'
+  }
+  Add-Journal 'autostart' @{ on = $on } | Out-Null
+}
+function Read-Consent([string]$q) {
+  # Explicit yes/no for opt-in features. Deliberately NOT answered by -Yes.
+  $a = Read-Host "$q [y/N]"
+  return ([string]$a).Trim().ToLower() -in 'y', 'yes', 'j', 'ja'
+}
+function Get-LoggerWanted($cfg, [bool]$interactive, [string]$modeName) {
+  # v1.0.2: the logger is opt-in. -NoLogger always wins; -Logger on opts in; an existing logger is kept as it is.
+  if ($NoLogger -or $Logger -eq 'off') { return $false }
+  if ($Logger -eq 'on') { return $true }
+  if ($cfg.loggerEnabled) { return $true }
+  if (-not $interactive) {
+    if ($modeName -eq 'baseline') { Say '  Logger not turned on (opt-in). The hook log still counts summary timers; add -Logger on to also record cost per request.' }
+    return $false
+  }
+  Say '  Optional local logger: a small PowerShell listener on 127.0.0.1 (this PC only) that records Claude Code''s own' 'Gray'
+  Say '  cost events (time, model, query_source, tokens, cost estimate; no prompts or responses). It sets 4 user' 'Gray'
+  Say '  variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_LOGS_EXPORTER, OTEL_EXPORTER_OTLP_LOGS_PROTOCOL/_ENDPOINT). -Logger off undoes it.' 'Gray'
+  $q = 'Turn on the local logger?'; if ($modeName -eq 'baseline') { $q = 'Turn on the local logger (recommended for a baseline measurement)?' }
+  return (Read-Consent $q)
+}
+function Get-AutostartChoice($cfg, [bool]$interactive) {
+  if ($Autostart -eq 'on') { return $true }
+  if ($Autostart -eq 'off') { return $false }
+  if ($null -ne $cfg.loggerAutostart -or (Test-RunValue)) { return (Get-AutostartWanted $cfg) }   # keep what is there
+  if (-not $interactive) { return $false }
+  Say "  Autostart would add the value $RunValueName to HKCU\...\CurrentVersion\Run (visible in Task Manager > Startup apps)" 'Gray'
+  Say '  so the logger starts hidden at every logon. Without it, the logger runs until you log off; run -Logger on to start it again.' 'Gray'
+  return (Read-Consent 'Start the logger at every logon?')
 }
 function Enable-Logger($cfg, [bool]$interactive) {
+  if ($NoLogger) { Say '  -NoLogger: logger configuration left alone.'; return $false }
   $conf = Get-OtelConflicts $cfg
   if ($conf.Count) {
     Warn 'Claude Code telemetry is already configured on this machine:'
     $conf | ForEach-Object { Say "   - $_" 'Yellow' }
     Say '   Turning on this logger would redirect Claude Code''s log events to this PC only, and settings.json/managed' 'Yellow'
     Say '   settings may override it anyway. Default is to leave telemetry alone (the hook still works).' 'Yellow'
-    if (-not ($interactive -and (AskYesNo 'Set up the local logger anyway?' $false))) { Say '  Logger skipped.'; return $false }
+    if (-not ($interactive -and (Read-Consent 'Set up the local logger anyway?'))) { Say '  Logger skipped.'; return $false }
   }
   if (-not $cfg.port -or -not ((Get-CollectorHealth ([int]$cfg.port)) -or (Test-PortFree ([int]$cfg.port)))) {
     $start = 47318; if ($Port) { $start = $Port }
     $cfg.port = Find-FreePort $start
     if (-not $cfg.port) { Warn 'No free local port found (47318-47367). Logger not set up.'; return $false }
   }
+  $auto = Get-AutostartChoice $cfg $interactive
   $vars = [ordered]@{
     CLAUDE_CODE_ENABLE_TELEMETRY     = '1'
     OTEL_LOGS_EXPORTER               = 'otlp'
@@ -169,22 +229,26 @@ function Enable-Logger($cfg, [bool]$interactive) {
   foreach ($k in $vars.Keys) { Set-UserEnv $k $vars[$k] }
   $cfg.loggerVars = New-Object PSObject -Property $vars
   $cfg.loggerEnabled = $true
+  $cfg.loggerAutostart = $auto
   Save-Config $cfg
+  if (-not $auto) { Remove-RunValue }
   $h = Start-Collector $cfg
-  if ($h) { Good "  Logger running on 127.0.0.1:$($cfg.port) (PID $($h.pid)); starts hidden at every logon." }
-  else { Warn "Logger did not answer on 127.0.0.1:$($cfg.port). See $(Join-Path $DataDir 'collector.log')." }
-  Add-Journal 'logger_on' @{ port = $cfg.port; healthy = [bool]$h } | Out-Null
+  $as = 'no autostart (-Autostart on to start it at every logon)'; if ($auto) { $as = "starts hidden at every logon (HKCU Run value $RunValueName; -Autostart off removes it)" }
+  if ($h) { Good "  Logger running on 127.0.0.1:$($cfg.port) (PID $($h.pid)); $as." }
+  elseif (-not $script:DryRun) { Warn "Logger did not answer on 127.0.0.1:$($cfg.port). See $(Join-Path $DataDir 'collector.log')." }
+  Add-Journal 'logger_on' @{ port = $cfg.port; healthy = [bool]$h; autostart = $auto } | Out-Null
   return $true
 }
-function Disable-Logger($cfg) {
+function Disable-Logger($cfg, [switch]$Uninstalling) {
   Stop-Collector $cfg
   foreach ($k in $OtelVarNames) {
     $cur = Get-UserEnv $k; $ours = $null
     if ($cfg.loggerVars -and $cfg.loggerVars.PSObject.Properties[$k]) { $ours = [string]$cfg.loggerVars.$k }
     if ($cur -and $ours -and $cur -eq $ours) { Set-UserEnv $k $null }
-    elseif ($cur) { Say "  left $k=$cur alone (not set by this tool)" }
+    elseif ($cur) { Say "  left $k alone (not set by this tool; value not shown)" }
   }
-  $cfg.loggerEnabled = $false; $cfg.loggerVars = $null; Save-Config $cfg
-  Add-Journal 'logger_off' @{} | Out-Null
+  $cfg.loggerEnabled = $false; $cfg.loggerVars = $null; $cfg.loggerAutostart = $null
+  if (-not $Uninstalling) { Save-Config $cfg; Add-Journal 'logger_off' @{} | Out-Null }
+  elseif (Test-Path -LiteralPath $ConfigPath) { Save-Config $cfg }   # uninstall: record 'logger off' so a later install asks again; never creates a new file
   Good '  Logger stopped and removed from autostart. Data kept.'
 }

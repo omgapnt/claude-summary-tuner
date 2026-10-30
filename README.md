@@ -76,11 +76,31 @@ Pick an option from the menu. Then **close and restart every Claude Code session
 
 > Read the script before you run it. It is one plain-text file, and the hook is embedded near the top as `$HookJs`.
 
+> **Used v1.0.0 or v1.0.1 with the logger on?** Those versions removed other apps' startup entries from your
+> Run key. Update to v1.0.2 and run `-ListLostStartupApps` to see which ones. Details and how to restore them:
+> [SECURITY.md](SECURITY.md#known-issue-in-v100-and-v101-other-apps-startup-entries-were-removed).
+
+## Is this safe?
+
+It is an unaudited, unsigned hobby script that puts a hook into Claude Code, so check it before you run it:
+
+1. **Download** `Claude-Summary-Tuner.ps1` and `SHA256SUMS` from the
+   [release page](https://github.com/omgapnt/claude-summary-tuner/releases) instead of piping anything into a shell.
+2. **Inspect** it. It is one plain-text file with no encoded parts. The hook (`$HookJs`) and the logger
+   (`$CollectorPs`) are near the top, and the header lists everything the script can change.
+3. **Verify the hash.** `Get-FileHash .\Claude-Summary-Tuner.ps1 -Algorithm SHA256` must match `SHA256SUMS`, or run
+   `.\Claude-Summary-Tuner.ps1 -Verify -ExpectedHash <sha256>` (read-only).
+4. **Dry run.** `.\Claude-Summary-Tuner.ps1 -Mode off -WhatIf` shows what it would change, and changes nothing.
+5. **Run** it.
+
+[SECURITY.md](SECURITY.md) lists every file, variable, registry value, process and port it touches, the known
+issues, and how to report a problem.
+
 ## Modes
 
 | # | Menu item | What happens | Agent panel status |
 |---|---|---|---|
-| 1 | **Baseline** | Hook installed in `pass` mode: it only counts summary timers and changes nothing. The logger starts. | unchanged (~30 s) |
+| 1 | **Baseline** | Hook installed in `pass` mode: it only counts summary timers and changes nothing. Asks whether to turn on the logger, which the report needs | unchanged (~30 s) |
 | 2 | **Slow 5 min** | Each summary timer waits at least 5 minutes | updates every ≥ 5 min |
 | 3 | **Custom minutes** | Like Slow, with your own interval (≥ 0.5 min, decimals OK, e.g. `2.5`) | updates every ≥ N min |
 | 4 | **Off** | Summary timers are dropped, so no `agent_summary` requests | stops updating |
@@ -88,8 +108,9 @@ Pick an option from the menu. Then **close and restart every Claude Code session
 | 6 | Restart check | Lists Claude processes still running from before the last change | |
 | 7 | Report | Builds and opens the HTML report | |
 | 8 | Replicate | Flamerix's A/B protocol, four short Haiku runs (see below) | |
-| 9 | Logger on/off | Starts or stops the local telemetry logger | |
-| 10 | Uninstall | Removes everything and asks whether to keep your data | |
+| 9 | Logger on/off | Starts or stops the local telemetry logger, and asks separately about starting it at logon | |
+| 10 | Uninstall | Removes the hook, settings, logger and autostart, and keeps your data unless you say otherwise | |
+| 11 | Lost startup apps | Read-only list of startup apps missing from your Run key (see the notice above) | |
 
 Command line equivalents:
 
@@ -102,9 +123,18 @@ Command line equivalents:
 .\Claude-Summary-Tuner.ps1 -CheckRestart
 .\Claude-Summary-Tuner.ps1 -Report [-ReportTo C:\path\report.html] [-NoOpen]
 .\Claude-Summary-Tuner.ps1 -Replicate [-ReplicateSlowMinutes 1] [-Yes]
-.\Claude-Summary-Tuner.ps1 -Logger on|off
+.\Claude-Summary-Tuner.ps1 -Logger on|off [-Autostart on|off]   # logger and its autostart are opt-in
+.\Claude-Summary-Tuner.ps1 -Autostart on|off                       # start the logger at logon, or not
+.\Claude-Summary-Tuner.ps1 -Mode baseline -Logger on               # non-interactive baseline with the logger
+.\Claude-Summary-Tuner.ps1 -Mode off -NoLogger                     # change mode, leave the logger as it is
 .\Claude-Summary-Tuner.ps1 -Uninstall [-KeepData | -DeleteData]
+.\Claude-Summary-Tuner.ps1 -Verify [-ExpectedHash <sha256>]        # read-only
+.\Claude-Summary-Tuner.ps1 -ListLostStartupApps                    # read-only
+.\Claude-Summary-Tuner.ps1 <any action> -WhatIf                    # show what would change, change nothing
 ```
+
+`-Yes` skips confirmations for runs such as `-Replicate`, but it never turns on the logger or autostart and never
+deletes data.
 
 ## The recommended experiment: baseline → switch → report
 
@@ -116,7 +146,9 @@ Command line equivalents:
    restart all sessions                    restart all sessions
 ```
 
-1. Choose **1 Baseline** and restart every Claude Code session. Then work as usual for a few days.
+1. Choose **1 Baseline**, answer **yes** to the logger (the report is built from its data), and restart every
+   Claude Code session. Then work as usual for a few days. Autostart is a separate question: without it, start
+   the logger again after a reboot with `-Logger on`.
 2. Choose **2 Slow**, **3 Custom** or **4 Off**, and restart every session again. Then work as usual for a few more days.
 3. Choose **7 Report**. For each period, the report shows `agent_summary` requests, Claude Code's cost estimate
    and the share of total spend, all **per active hour**. Idle nights do not dilute the comparison. It also
@@ -191,11 +223,12 @@ flowchart LR
 - **Windows gate:** the hook installs only when `Bun.main` is the compiled Claude Code entry. That is
   `/$bunfs/…` on Linux/macOS and `X:/~BUN/…` on Windows.
 - **BUN_OPTIONS quirks:** Bun needs forward slashes and no spaces. Quoted paths are silently ignored. If your
-  profile path contains a space, the script uses the 8.3 short path or a `%ProgramData%` folder, and it checks
+  profile path contains a space, the script uses the 8.3 short path (or asks you for `-DataDir`), and it checks
   that the preload really loads before it saves anything. Since v1.0.1 it writes `--preload=<path>`. The older
   space form, `--preload <path>`, breaks standalone `bun` subcommands (see the FAQ).
-- **The logger** is a small PowerShell `HttpListener` on a loopback port, with a `TcpListener` fallback. It autostarts hidden at logon via
-  `HKCU\…\Run\ClaudeSummaryTunerCollector`, which shows up in Task Manager → Startup apps.
+- **The logger** is a small PowerShell `TcpListener` on a loopback port (127.0.0.1). It is opt-in. If you also turn
+  on autostart, it starts hidden at logon via `HKCU\…\Run\ClaudeSummaryTunerCollector`, which shows up in
+  Task Manager → Startup apps.
 
 ## The Claude desktop app
 
@@ -237,8 +270,11 @@ desktop app and its Code-tab processes and tell you when the app was started bef
 
 ## Safety & privacy
 
-- **No admin.** Everything is per-user: files in `%LOCALAPPDATA%\cc-summary-tuner\`, user env vars and one HKCU
-  Run value.
+- **No admin.** Everything is per-user: files in `%LOCALAPPDATA%\cc-summary-tuner\`, user env vars, and one HKCU
+  Run value only if you turn on logger autostart. Since v1.0.2 the tool touches only its own Run value
+  (v1.0.0 and v1.0.1 removed other apps' entries, see above).
+- **Opt-in logger.** Since v1.0.2 nothing listens on a port and nothing starts at logon unless you choose it.
+- **No secrets on screen.** `OTEL_*` values and variables named like keys, tokens or headers are shown by name only.
 - **Loopback only.** The logger binds to `127.0.0.1`, so nothing leaves your PC.
 - **No prompt text.** Claude Code redacts prompts in telemetry by default, and this tool never turns prompt
   logging on. For each API request it stores only the time, event type, model, `query_source`, token counts,
@@ -254,9 +290,13 @@ desktop app and its Code-tab processes and tell you when the app was started bef
 ## Uninstall
 
 ```powershell
-.\Claude-Summary-Tuner.ps1 -Uninstall              # asks whether to keep the data
+.\Claude-Summary-Tuner.ps1 -Uninstall              # asks whether to keep the data (-Yes keeps it)
 .\Claude-Summary-Tuner.ps1 -Uninstall -DeleteData
 ```
+
+`-DeleteData` deletes only files that v1.0.2 or later recorded as created by itself, by exact path. Logger output
+(`events-*.tsv`), Replicate output, files from older versions and anything else in the folder stay. Delete the
+folder yourself if you want everything gone.
 
 Without the script: delete the user env vars `BUN_OPTIONS` (or only our `--preload=…no-agent-summary.js` part of
 it), `CC_AGENT_SUMMARY_MODE`, `CC_AGENT_SUMMARY_MIN_DELAY_MS` and `CC_AGENT_SUMMARY_LOG`. If you used the logger,
@@ -331,7 +371,10 @@ on Linux, reported working on macOS). This script is Windows-only. Only the unit
 | Logger capturing `agent_summary` requests by `query_source` | ✅ Matched the debug-log fork counts in the same run |
 | `--preload=` form loads the hook (CLI 2.1.312 and desktop app's 2.1.309) and `bun install` works with it (bun 1.4.3) | ✅ v1.0.1, on Windows |
 | Upgrade from v1.0.0 (rewrites the space form, keeps the mode) | ✅ v1.0.1, on Windows |
-| Unit tests: BUN_OPTIONS merge and upgrade, version drift, path anonymising, number formatting under de-CH, periods, report | ✅ `pwsh test/unit.ps1`, 43/43 pass (run locally; no CI workflow yet) |
+| Unit tests: BUN_OPTIONS merge and upgrade, version drift, path anonymising, number formatting under de-CH, periods, report, secrets hidden, no `New-Item -Force`, every change goes through the change gate | ✅ `test/unit.ps1`, v1.0.2: 64/64 on Windows PowerShell 5.1 and 7 (incl. the registry test). Run locally; no CI workflow yet |
+| Run key fix: other startup entries survive, only our value is set or removed, `-WhatIf` writes nothing, lost-startup-apps detection | ✅ `test/registry-windows.ps1` against a scratch key under `HKCU\Software\ClaudeSummaryTunerTest`, never the real Run key |
+| Safety regressions: `-DeleteData` keeps foreign files, `-WhatIf` runs nothing, `-Yes` never deletes data, `-NoLogger` never restarts the logger, logger stop matches only our own process | ✅ `test/security-regressions.ps1`, 49/49 on 5.1 and 7 |
+| Logger: plain, gzip and chunked OTLP, size caps, malformed input never logged, slow clients, storage quota | ✅ `test/collector-integration.py`, 14/14 on 5.1 and 7 (synthetic loopback traffic only) |
 | Script runs on Windows | ✅ Replicate, Status, upgrade and Report; parse-checked with Windows PowerShell 5.1 and PowerShell 7.6 |
 | Desktop app's bundled Claude Code (2.1.309) honouring `BUN_OPTIONS`: no hook / pass / off / slow | ✅ Replicate protocol against the bundled binary, 5 / 5 / 0 / 2. A live Code-tab session with the hook **not yet observed** |
 | Full first-time install flow on a fresh machine | ⚠️ **not yet tested.** Please report |
@@ -343,7 +386,11 @@ on Linux, reported working on macOS). This script is Windows-only. Only the unit
 ```text
 Claude-Summary-Tuner.ps1   the single-file download (built from src/, CRLF, ASCII)
 src/                       hook.js, collector.ps1 and script parts; build.sh rebuilds the root script
-test/unit.ps1              unit tests (pwsh, synthetic data)
+test/unit.ps1              unit tests (pwsh, synthetic data; runs test/registry-windows.ps1 on Windows)
+test/registry-windows.ps1  Run-key test against a scratch HKCU key (Windows only)
+test/security-regressions.ps1  -DeleteData / -WhatIf / -Yes / -NoLogger regressions (Windows)
+test/collector-integration.py  logger against synthetic loopback traffic (Windows, Python 3)
+SECURITY.md                what the script changes, known issues, how to verify and report
 test/fixtures/             sample report, our anonymised Windows and desktop-app replicate results
 docs/img/                  screenshots
 ```
